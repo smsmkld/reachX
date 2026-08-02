@@ -111,8 +111,11 @@ function scanAllSendersForReplies() {
     // CacheService passes data between this run and any chained batch runs.
     // Max value size is 100KB — for large threadId lists, we pass the
     // leadsSheetId and re-read the map in each batch instead of caching it.
+    // The sender list is deliberately NOT cached: at 200-300 senders the array
+    // alone is 50-80KB of JSON and would push this value past the 100KB
+    // CacheService limit once repliedThreadIds start accumulating. Each batch
+    // re-reads it from senderAccounts instead.
     const scanState = {
-      senders:         senders,
       leadsSheetId:    leadsSheetId,
       repliedThreadIds: [],
       totalBatches:    Math.ceil(senders.length / FETCH_BATCH_SIZE),
@@ -175,8 +178,15 @@ function processReplyBatch_(batchIndex) {
     return;
   }
 
-  const { senders, leadsSheetId, totalBatches } = state;
+  const { leadsSheetId, totalBatches } = state;
   const repliedThreadIds = state.repliedThreadIds || [];
+
+  // Re-read the sender list every batch — it is not carried in the cached state
+  const senders = getActiveSendersForScan();
+  if (senders.length === 0) {
+    log('processReplyBatch_: no active senders found — exiting', 'WARN');
+    return;
+  }
 
   // Re-read masterLeads fresh every batch — avoids CacheService size limit
   const { threadMap } = buildThreadIdMap(leadsSheetId);
@@ -258,8 +268,18 @@ function processReplyBatch_(batchIndex) {
           log('processReplyBatch_: non-200 (' + code + ') from sender ' + meta.emailID, 'ERROR');
           continue;
         }
-        const result        = JSON.parse(response.getContentText());
-        const senderReplies = result.replies || [];
+        const result = JSON.parse(response.getContentText());
+        // Stamp the owning sender onto every reply. The sender's handleScanReplies
+        // returns only { threadId, replyDate }, but updateSenderAccountsReplyCounts_
+        // groups by senderEmail — without this it groups nothing, matches no rows,
+        // and still reports success.
+        const senderReplies = (result.replies || []).map(function(rep) {
+          return {
+            threadId:    rep.threadId,
+            replyDate:   rep.replyDate,
+            senderEmail: rep.senderEmail || meta.emailAddress
+          };
+        });
         batchReplies = batchReplies.concat(senderReplies);
         log('processReplyBatch_: sender ' + meta.emailID + ' — ' + senderReplies.length + ' replies', 'INFO');
       } catch (e) {
@@ -276,8 +296,17 @@ function processReplyBatch_(batchIndex) {
   const nextBatchIndex = batchIndex + 1;
   if (nextBatchIndex < totalBatches) {
     state.repliedThreadIds = allReplies;
-    state.nextBatchIndex   = nextBatchIndex + 1;  // set here — single source of truth
-    cache.put(SCAN_PROGRESS_KEY, JSON.stringify(state), 600);
+    state.nextBatchIndex   = nextBatchIndex;  // the batch runNextReplyBatch_ must run next
+    try {
+      cache.put(SCAN_PROGRESS_KEY, JSON.stringify(state), 600);
+    } catch (e) {
+      // CacheService rejects values over 100KB — write what we have rather than
+      // dying and leaving replied leads unmarked.
+      log('processReplyBatch_: could not cache scan state — ' + e.message +
+          ' — writing partial results', 'ERROR');
+      writeReplyUpdates_(allReplies, leadsSheetId);
+      return;
+    }
 
     try {
       ScriptApp.newTrigger('runNextReplyBatch_')
@@ -640,12 +669,19 @@ function updateSenderAccountsReplyCounts_(repliedThreadIds) {
     headers.forEach(function(h, i) { col[String(h).trim()] = i; });
 
     const repliesPerSender = {};
+    let unattributed = 0;
     repliedThreadIds.forEach(function(match) {
       const sender = String(match.senderEmail || '').toLowerCase();
-      if (!sender) { return; }
+      if (!sender) { unattributed++; return; }
       repliesPerSender[sender] = (repliesPerSender[sender] || 0) + 1;
     });
 
+    if (unattributed > 0) {
+      log('updateSenderAccountsReplyCounts_: ' + unattributed + ' replies had no senderEmail — ' +
+          'they cannot be counted against a sender', 'WARN');
+    }
+
+    let matchedRows = 0, added = 0;
     for (let i = 0; i < data.length; i++) {
       const email = String(data[i][col['emailAddress']] || '').trim().toLowerCase();
       if (!repliesPerSender[email]) { continue; }
@@ -653,16 +689,23 @@ function updateSenderAccountsReplyCounts_(repliedThreadIds) {
         data[i][col['repliesReceived']] =
           (parseInt(data[i][col['repliesReceived']] || 0, 10)) +
           repliesPerSender[email];
+        matchedRows++;
+        added += repliesPerSender[email];
       }
+    }
+
+    if (matchedRows === 0) {
+      log('updateSenderAccountsReplyCounts_: no senderAccounts rows matched — ' +
+          'nothing written. Replies seen for: ' + (Object.keys(repliesPerSender).join(', ') || 'nobody') +
+          ('repliesReceived' in col ? '' : ' (senderAccounts has no repliesReceived column)'), 'WARN');
+      return;
     }
 
     sheet.getRange(2, 1, data.length, headers.length).setValues(data);
     SpreadsheetApp.flush();
-    log('updateSenderAccountsReplyCounts_: updated repliesReceived in senderAccounts', 'INFO');
+    log('updateSenderAccountsReplyCounts_: added ' + added + ' replies across ' +
+        matchedRows + ' sender row(s)', 'INFO');
   } catch (e) {
     log('updateSenderAccountsReplyCounts_: error — ' + e.message, 'ERROR');
   }
 }
-
-
-
