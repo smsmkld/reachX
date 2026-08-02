@@ -532,9 +532,14 @@ function processSingleSend() {
           inboxSheet.getRange(myRow.rowIndex, colMap[COLD_COLS.status]   + 1).setValue('Sent');
           inboxSheet.getRange(myRow.rowIndex, colMap[COLD_COLS.sentTime] + 1).setValue(nowStr);
 
-          // Increment sentToday in Config
-          updateConfigValue(configSheet, 'sentToday', String(sentToday + 1));
-          updateConfigValue(configSheet, 'totalSentCount', String(parseInt(config.totalSentCount || 0, 10) + 1));
+          // Increment sentToday in Config.
+          // Re-read inside the lock: sentToday was read before the lock was taken
+          // and the followup chain increments the same key, so using the stale
+          // value loses one of the two increments and the sender overshoots
+          // dailyLimit.
+          const lockedConfig = getConfig(configSheet);
+          updateConfigValue(configSheet, 'sentToday', String(parseInt(lockedConfig.sentToday || 0, 10) + 1));
+          updateConfigValue(configSheet, 'totalSentCount', String(parseInt(lockedConfig.totalSentCount || 0, 10) + 1));
           updateConfigValue(configSheet, 'lastRunTime', new Date().toISOString());
 
           updates.push({
@@ -1374,8 +1379,29 @@ function localTimeToUtcMs_(localTimeStr, timezone) {
     }
   }
 
-  log('localTimeToUtcMs_: all ' + MAX_RETRIES + ' attempts failed — returning NaN', 'ERROR');
-  return NaN;
+  // All timeapi.io attempts failed. Do NOT return NaN — the callers feed this
+  // straight into createChainedTrigger_(), .after(NaN) throws, and the sender then
+  // sends nothing for the rest of the day. At 200-300 senders hammering timeapi.io
+  // in the same few minutes this is a realistic daily occurrence, so fall back to
+  // the local IANA timezone database, which needs no network at all.
+  log('localTimeToUtcMs_: all ' + MAX_RETRIES + ' attempts failed — using local timezone fallback', 'WARN');
+  try {
+    const now        = new Date();
+    const parts      = Utilities.formatDate(now, timezone, 'HH:mm:ss').split(':');
+    const nowMinutes = parseInt(parts[0], 10) * 60 + parseInt(parts[1], 10);
+    const nowSecond  = parseInt(parts[2], 10);
+
+    let diffMinutes = (targetHour * 60 + targetMinute) - nowMinutes;
+    if (diffMinutes < 0) { diffMinutes += 24 * 60; }
+
+    const diffMs = (diffMinutes * 60 - nowSecond) * 1000;
+    log('localTimeToUtcMs_: fallback tz=' + timezone + ' diffMs=' + diffMs, 'WARN');
+    return now.getTime() + diffMs;
+
+  } catch (e) {
+    log('localTimeToUtcMs_: fallback failed — ' + e.message, 'ERROR');
+    return NaN;
+  }
 }
 
 
