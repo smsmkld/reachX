@@ -524,9 +524,13 @@ function processSingleFollowup() {
           inboxSheet.getRange(myRow.rowIndex, colMap[FOLLOWUP_COLS.status]      + 1).setValue('Sent');
           inboxSheet.getRange(myRow.rowIndex, colMap[FOLLOWUP_COLS.lastSentTime] + 1).setValue(nowStr);
 
-          // Increment sentToday in Config
-          updateConfigValue(configSheet, 'sentToday', String(sentToday + 1));
-          updateConfigValue(configSheet, 'totalSentCount', String(parseInt(config.totalSentCount || 0, 10) + 1));
+          // Increment sentToday in Config.
+          // Re-read inside the lock — the cold chain increments the same key, so
+          // using the value read before the lock loses one of the two increments
+          // and the sender overshoots dailyLimit.
+          const lockedConfig = getConfig(configSheet);
+          updateConfigValue(configSheet, 'sentToday', String(parseInt(lockedConfig.sentToday || 0, 10) + 1));
+          updateConfigValue(configSheet, 'totalSentCount', String(parseInt(lockedConfig.totalSentCount || 0, 10) + 1));
           updateConfigValue(configSheet, 'lastRunTime', new Date().toISOString());
 
           updates.push({
