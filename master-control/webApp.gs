@@ -113,6 +113,25 @@ function doPost(e) {
     if (action === 'archiveCampaignLeads') {
      return buildResponse(handleArchiveCampaignLeads(params), corsHeaders); 
     }
+    if (action === 'getSettings') {
+      return buildResponse(handleGetSettings(params), corsHeaders);
+    }
+
+    if (action === 'updateSettings') {
+      return buildResponse(handleUpdateSettings(params), corsHeaders);
+    }
+
+    if (action === 'createCampaign') {
+      return buildResponse(handleCreateCampaign(params), corsHeaders);
+    }
+
+    if (action === 'distributeCold') {
+      return buildResponse(handleRunDistributeCold(params), corsHeaders);
+    }
+
+    if (action === 'distributeFollowups') {
+      return buildResponse(handleRunDistributeFollowups(params), corsHeaders);
+    }
 
     if (action === 'getCampaigns') { 
       return buildResponse(handleGetCampaigns(params), corsHeaders); 
@@ -345,6 +364,16 @@ function handleUpdateColdSent(params) {
     return { success: false, error: 'No updates provided' };
   }
 
+  // MUST hold the lock: getLastRow() + setValues() is a read-modify-write, and at
+  // 200-300 senders several senders POST here at the same time. Without the lock
+  // two executions compute the same startRow and one silently overwrites the
+  // other, and processStagingUpdates() can clear rows appended after it read.
+  // A false here makes the sender cache the batch and retry (savePendingUpdates_).
+  if (!acquireLock(30)) {
+    log('handleUpdateColdSent: could not acquire lock — sender will retry', 'WARN');
+    return { success: false, error: 'Busy — could not acquire lock' };
+  }
+
   try {
     const ss           = SpreadsheetApp.openById(MASTER_SHEET_ID);
     const stagingSheet = ss.getSheetByName('stagingUpdates');
@@ -381,6 +410,8 @@ function handleUpdateColdSent(params) {
   } catch (e) {
     log('handleUpdateColdSent: error — ' + e.message, 'ERROR');
     return { success: false, error: e.message };
+  } finally {
+    releaseLock();
   }
 }
 
@@ -401,6 +432,12 @@ function handleUpdateFollowupSent(params) {
   const updates = params.updates || [];
   if (updates.length === 0) {
     return { success: false, error: 'No updates provided' };
+  }
+
+  // Same concurrent read-modify-write hazard as handleUpdateColdSent — see note there.
+  if (!acquireLock(30)) {
+    log('handleUpdateFollowupSent: could not acquire lock — sender will retry', 'WARN');
+    return { success: false, error: 'Busy — could not acquire lock' };
   }
 
   try {
@@ -439,6 +476,8 @@ function handleUpdateFollowupSent(params) {
   } catch (e) {
     log('handleUpdateFollowupSent: error — ' + e.message, 'ERROR');
     return { success: false, error: e.message };
+  } finally {
+    releaseLock();
   }
 }
 
@@ -898,6 +937,8 @@ function incrementSenderCounters(coldCount, followupCount, senderId) {
     const col = {};
     headers.forEach(function(h, i) { col[String(h).trim()] = i; });
 
+    let matchedIndex = -1;
+
     for (let i = 0; i < data.length; i++) {
       const rowSenderId = String(data[i][col['emailID']] || '').trim();
       if (rowSenderId !== senderId) { continue; }
@@ -906,10 +947,20 @@ function incrementSenderCounters(coldCount, followupCount, senderId) {
       if ('totalSentCount'     in col) { data[i][col['totalSentCount']]     = (parseInt(data[i][col['totalSentCount']]     || 0, 10)) + coldCount + followupCount; }
       if ('totalLeadsContacted' in col && coldCount > 0) { data[i][col['totalLeadsContacted']] = (parseInt(data[i][col['totalLeadsContacted']] || 0, 10)) + coldCount; }
       if ('lastRunTime'        in col) { data[i][col['lastRunTime']]        = new Date().toISOString(); }
+      matchedIndex = i;
       break;
     }
 
-    sheet.getRange(2, 1, data.length, headers.length).setValues(data);
+    if (matchedIndex === -1) {
+      log('incrementSenderCounters: sender ' + senderId + ' not found in senderAccounts', 'WARN');
+      return;
+    }
+
+    // Write ONLY this sender's row. Writing back the whole array would push a
+    // snapshot taken at read time over the top of every other sender's row —
+    // at 200-300 senders that reverts other senders' counters and any UI edit
+    // (dailyLimit, isActive, tags) made while this request was in flight.
+    sheet.getRange(matchedIndex + 2, 1, 1, headers.length).setValues([data[matchedIndex]]);
     SpreadsheetApp.flush();
 
   } catch (e) {
@@ -1188,7 +1239,17 @@ function handlePurgeAllInboxes(params) {
   // Step 1: Purge all sender inboxes
   const result = fanOutToSenders_('purgeInbox', 'handlePurgeAllInboxes');
 
-  // Step 2: Reset all Queued/Sending leads back to Pending in masterLeads
+    // Step 2: Reset all Queued/Sending leads back to Pending in masterLeads.
+  // Needs the lock — this rewrites the whole sheet, and processStagingUpdates
+  // runs every 10 minutes, so without it one silently overwrites the other.
+  if (!acquireLock(30)) {
+    log('handlePurgeAllInboxes: could not acquire lock — inboxes were purged but ' +
+        'masterLeads was NOT reset', 'ERROR');
+    result.resetLeads = false;
+    result.resetError = 'Could not acquire lock — run purgeAllInboxes again in a minute';
+    return result;
+  }
+
   try {
     const settings     = getSettings(MASTER_SHEET_ID);
     const leadsSheetId = settings.leadsSpreadsheetId;
@@ -1221,8 +1282,12 @@ function handlePurgeAllInboxes(params) {
             data[i][col['sequenceStep']] = currentStep - 1;
             // ownerSender stays — followup must go to same sender
           } else {
-            // Mid sequence — KEEP owner
-            data[i][col['status']] = 'Sent';
+            // Mid sequence — the queued step was never actually sent, so step
+            // back to the last step that WAS sent. Without this the next
+            // distribution run queues the FOLLOWING step and that email is
+            // skipped for this lead entirely.
+            data[i][col['status']]       = 'Sent';
+            data[i][col['sequenceStep']] = currentStep - 1;
             // ownerSender stays — followup must go to same sender
           }
           resetCount++;
@@ -1241,6 +1306,8 @@ function handlePurgeAllInboxes(params) {
     log('handlePurgeAllInboxes: error resetting masterLeads — ' + e.message, 'ERROR');
     result.resetLeads = false;
     result.resetError = e.message;
+  } finally {
+    releaseLock();
   }
 
   return result;
@@ -1941,8 +2008,14 @@ function handleSendTestEmailDirect(params) {
 
 function handleResetOrphanedLeads(params) {
   const senderId = String(params.senderId || '').trim();
-  if (!senderId) {
+    if (!senderId) {
     return { success: false, error: 'Missing senderId' };
+  }
+
+  // Rewrites the whole masterLeads sheet — must hold the lock so it cannot
+  // collide with processStagingUpdates or a distribution run.
+  if (!acquireLock(30)) {
+    return { success: false, error: 'Busy — could not acquire lock, try again' };
   }
 
   try {
@@ -1980,8 +2053,10 @@ function handleResetOrphanedLeads(params) {
           data[i][col['sequenceStep']] = currentStep - 1;
           // ownerSender stays — followup must go to same sender
         } else {
-          // Mid sequence — KEEP owner
-          data[i][col['status']] = 'Sent';
+          // Mid sequence — the queued step was never actually sent, so step back
+          // to the last step that WAS sent, or that email gets skipped.
+          data[i][col['status']]       = 'Sent';
+          data[i][col['sequenceStep']] = currentStep - 1;
           // ownerSender stays — followup must go to same sender
         }
         resetCount++;
@@ -1997,9 +2072,11 @@ function handleResetOrphanedLeads(params) {
         ' leads for sender ' + senderId, 'INFO');
     return { success: true, reset: resetCount };
 
-  } catch (e) {
+    } catch (e) {
     log('handleResetOrphanedLeads: error — ' + e.message, 'ERROR');
     return { success: false, error: e.message };
+  } finally {
+    releaseLock();
   }
 }
 
@@ -2203,6 +2280,7 @@ function handleGetCampaigns(params) {
       if (!campaignMap[campaignId]) {
         campaignMap[campaignId] = {
           campaignId:          campaignId,
+          campaignName:        String(data[i][col['campaignName']]        || '').trim(),
           campaignStatus:      String(data[i][col['campaignStatus']]      || '').trim(),
           totalSequenceSteps:  parseInt(data[i][col['totalSequenceSteps']] || 1, 10),
           assignedSenders:     String(data[i][col['assignedSenders']]     || '').trim(),
@@ -2242,6 +2320,115 @@ function handleGetCampaigns(params) {
   }
 }
 
+function handleCreateCampaign(params) {
+  const steps = params.steps || [];
+  if (!Array.isArray(steps) || steps.length === 0) {
+    return { success: false,
+             error: 'steps is required — [{ subjectLine, emailBody, awaitDays }, ...]' };
+  }
+
+  if (!acquireLock(30)) {
+    return { success: false, error: 'Busy — could not acquire lock' };
+  }
+
+  try {
+    const ss    = SpreadsheetApp.openById(MASTER_SHEET_ID);
+    const sheet = ss.getSheetByName('Campaigns');
+    if (!sheet) { return { success: false, error: 'Campaigns sheet not found' }; }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const col     = {};
+    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+
+    if (!('campaignId' in col) || !('sequenceStep' in col)) {
+      return { success: false,
+               error: 'Campaigns sheet is missing a campaignId or sequenceStep column' };
+    }
+
+    // Generate the next id: C001, C002, ...
+    let maxNum    = 0;
+    const lastRow = sheet.getLastRow();
+    if (lastRow > 1) {
+      const existing = sheet.getRange(2, col['campaignId'] + 1, lastRow - 1, 1).getValues();
+      for (let i = 0; i < existing.length; i++) {
+        const m = String(existing[i][0] || '').trim().match(/^C(\d+)$/i);
+        if (m) { maxNum = Math.max(maxNum, parseInt(m[1], 10)); }
+      }
+    }
+    const campaignId = 'C' + String(maxNum + 1).padStart(3, '0');
+
+    // One row per step
+    const today = formatDate(new Date());
+    const rows  = [];
+
+    for (let s = 0; s < steps.length; s++) {
+      const row = new Array(headers.length).fill('');
+      const set = function(name, value) {
+        if (name in col) { row[col[name]] = value; }
+      };
+
+      set('campaignId',         campaignId);
+      set('campaignName',       params.campaignName || campaignId);
+      set('sequenceStep',       s + 1);
+      set('totalSequenceSteps', steps.length);
+      set('campaignStatus',     params.campaignStatus || 'Paused');
+      set('assignedSenders',    params.assignedSenders || '');
+      set('windowStart',        params.windowStart     || '');
+      set('windowEnd',          params.windowEnd       || '');
+      set('sendingDays',        params.sendingDays     || '');
+      set('timezone',           params.timezone        || '');
+      set('subjectLine',        steps[s].subjectLine   || '');
+      set('emailBody',          steps[s].emailBody     || '');
+      set('awaitDays',          parseInt(steps[s].awaitDays || 0, 10));
+      set('createdDate',        today);
+      set('lastModified',       today);
+      set('totalLeads',    0);
+      set('sentCount',     0);
+      set('replyCount',    0);
+      set('pendingCount',  0);
+      set('bouncedEmails', 0);
+      if (params.coldPriorityLimit     !== undefined) { set('coldPriorityLimit',     params.coldPriorityLimit); }
+      if (params.followupPriorityLimit !== undefined) { set('followupPriorityLimit', params.followupPriorityLimit); }
+
+      rows.push(row);
+    }
+
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, headers.length).setValues(rows);
+    SpreadsheetApp.flush();
+
+    log('handleCreateCampaign: created ' + campaignId + ' with ' + rows.length + ' steps', 'INFO');
+    return { success: true, campaignId: campaignId, rowsCreated: rows.length };
+
+  } catch (e) {
+    log('handleCreateCampaign: error — ' + e.message, 'ERROR');
+    return { success: false, error: e.message };
+  } finally {
+    releaseLock();
+  }
+}
+
+function handleRunDistributeCold(params) {
+  try {
+    ScriptApp.newTrigger('runDistributeColdNow').timeBased().after(5000).create();
+    log('handleRunDistributeCold: queued', 'INFO');
+    return { success: true, message: 'Cold distribution queued — starts within about a minute' };
+  } catch (e) {
+    log('handleRunDistributeCold: error — ' + e.message, 'ERROR');
+    return { success: false, error: e.message };
+  }
+}
+
+function handleRunDistributeFollowups(params) {
+  try {
+    ScriptApp.newTrigger('runDistributeFollowupsNow').timeBased().after(5000).create();
+    log('handleRunDistributeFollowups: queued', 'INFO');
+    return { success: true, message: 'Followup distribution queued — starts within about a minute' };
+  } catch (e) {
+    log('handleRunDistributeFollowups: error — ' + e.message, 'ERROR');
+    return { success: false, error: e.message };
+  }
+}
+
 function handleUpdateCampaign(params) {
   const campaignId = String(params.campaignId || '').trim();
   if (!campaignId) { return { success: false, error: 'Missing campaignId' }; }
@@ -2264,6 +2451,7 @@ function handleUpdateCampaign(params) {
       const step = parseInt(data[i][col['sequenceStep']] || 1, 10);
 
       // Update global campaign fields on ALL rows
+      if (params.campaignName    !== undefined && 'campaignName' in col) { data[i][col['campaignName']] = params.campaignName; }
       if (params.campaignStatus  !== undefined) { data[i][col['campaignStatus']]  = params.campaignStatus; }
       if (params.windowStart     !== undefined) { data[i][col['windowStart']]     = params.windowStart; }
       if (params.windowEnd       !== undefined) { data[i][col['windowEnd']]       = params.windowEnd; }
@@ -2684,6 +2872,96 @@ function handleGetSystemStatus(params) {
     return { success: false, error: e.message };
   }
 }
+/**
+ * Returns the Settings sheet as a flat object so a UI can render it.
+ */
+function handleGetSettings(params) {
+  try {
+    const settings = getSettings(MASTER_SHEET_ID);
+    // leadsSpreadsheetId is the one value that must never be edited from a UI —
+    // a typo there points the whole system at an empty sheet.
+    const out = {};
+    Object.keys(settings).forEach(function(k) {
+      if (k === 'leadsSpreadsheetId') { return; }
+      out[k] = settings[k];
+    });
+    out.leadsSpreadsheetConfigured = !!settings.leadsSpreadsheetId;
+    return { success: true, settings: out };
+  } catch (e) {
+    log('handleGetSettings: error — ' + e.message, 'ERROR');
+    return { success: false, error: e.message };
+  }
+}
+
+var SETTINGS_WRITABLE = [
+  'coldPriorityLimit', 'followupPriorityLimit', 'flexibleAllocation',
+  'distributionMethod', 'alertsEmail',
+  'sendingWindowStart', 'sendingWindowEnd', 'sendingDays', 'timeZone',
+  'warmupEnabled', 'warmupStartLimit', 'warmupIncreaseBy',
+  'warmupEveryDays', 'warmupMaxLimit', 'warmupNextIncreaseDate'
+];
+
+/**
+ * Updates key/value pairs in the Settings sheet.
+ * Only keys in SETTINGS_WRITABLE may change. leadsSpreadsheetId is deliberately
+ * not writable, and warmupCurrentLimit is managed by runWarmupIncrease.
+ */
+function handleUpdateSettings(params) {
+  const incoming = params.settings || {};
+  const keys = Object.keys(incoming);
+  if (keys.length === 0) {
+    return { success: false, error: 'No settings provided' };
+  }
+
+  if (!acquireLock(30)) {
+    return { success: false, error: 'Busy — could not acquire lock, try again' };
+  }
+
+  try {
+    const ss    = SpreadsheetApp.openById(MASTER_SHEET_ID);
+    const sheet = ss.getSheetByName('Settings');
+    if (!sheet) { return { success: false, error: 'Settings sheet not found' }; }
+
+    const lastRow = Math.max(1, sheet.getLastRow());
+    const data    = sheet.getRange(1, 1, lastRow, 2).getValues();
+    const rowOf   = {};
+    data.forEach(function(r, i) {
+      const k = String(r[0]).trim();
+      if (k) { rowOf[k] = i; }
+    });
+
+    const updated = [], rejected = [];
+
+    keys.forEach(function(key) {
+      if (SETTINGS_WRITABLE.indexOf(key) === -1) { rejected.push(key); return; }
+
+      let value = incoming[key];
+      // Dates must land as text or Sheets reformats them and formatDate()
+      // comparisons stop matching — same trick runWarmupIncrease uses.
+      if (key === 'warmupNextIncreaseDate' && value) { value = "'" + String(value).trim(); }
+      else { value = String(value); }
+
+      if (key in rowOf) { data[rowOf[key]][1] = value; }
+      else              { data.push([key, value]); }
+      updated.push(key);
+    });
+
+    if (updated.length > 0) {
+      sheet.getRange(1, 1, data.length, 2).setValues(data);
+      SpreadsheetApp.flush();
+    }
+
+    log('handleUpdateSettings: updated ' + updated.join(', ') +
+        (rejected.length ? ' — rejected ' + rejected.join(', ') : ''), 'INFO');
+    return { success: true, updated: updated, rejected: rejected };
+
+  } catch (e) {
+    log('handleUpdateSettings: error — ' + e.message, 'ERROR');
+    return { success: false, error: e.message };
+  } finally {
+    releaseLock();
+  }
+}
 
 function handleGetSenders(params) {
   try {
@@ -2707,6 +2985,9 @@ function handleGetSenders(params) {
         dailyLimit:     parseInt(row[col['dailyLimit']]   || 25, 10),
         sentToday:      parseInt(row[col['sentToday']]    || 0,  10),
         totalSentCount: parseInt(row[col['totalSentCount']]|| 0, 10),
+        // Dashboard reply/bounce rates divide by this, not by totalSentCount —
+        // followups inflate totalSentCount so it is the wrong denominator.
+        totalLeadsContacted: parseInt(row[col['totalLeadsContacted']] || 0, 10),
         repliesReceived:parseInt(row[col['repliesReceived']]||0, 10),
         bouncedEmails:  parseInt(row[col['bouncedEmails']] || 0, 10),
         lastRunTime:    String(row[col['lastRunTime']]    || '').trim()
