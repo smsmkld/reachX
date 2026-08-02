@@ -70,11 +70,14 @@ function distributeCold() {
 
   startExecutionTimer_();
 
-  // Check if this is a continuation run
-  const coldCheckpoint = loadCheckpoint_('distributeCold');
-  const coldStartIndex = coldCheckpoint ? (coldCheckpoint.campaignIndex || 0) : 0;
-  if (coldStartIndex > 0) {
-    log('distributeCold: resuming from campaign index ' + coldStartIndex, 'INFO');
+  // Check if this is a continuation run.
+  // Resume by campaignId, NOT by index: leads queued in the previous pass are no
+  // longer Pending, so fully-processed campaigns drop out of the eligible set and
+  // every positional index shifts down. Resuming on a stale index skips campaigns.
+  const coldCheckpoint     = loadCheckpoint_('distributeCold');
+  const coldResumeCampaign = coldCheckpoint ? String(coldCheckpoint.campaignId || '') : '';
+  if (coldResumeCampaign) {
+    log('distributeCold: resuming from campaign ' + coldResumeCampaign, 'INFO');
   }
 
   if (!acquireLock(LOCK_WAIT_SECONDS)) {
@@ -168,6 +171,16 @@ function distributeCold() {
 
     // --- Step 5: Distribute per campaign ---
     const campaignIds = Object.keys(leadsByCampaign).sort();
+
+    // Map the checkpointed campaignId back onto the freshly-read campaign list
+    let coldStartIndex = 0;
+    if (coldResumeCampaign) {
+      const coldResumeAt = campaignIds.indexOf(coldResumeCampaign);
+      coldStartIndex = coldResumeAt >= 0 ? coldResumeAt : 0;
+      log('distributeCold: resume campaign ' + coldResumeCampaign +
+          ' resolved to index ' + coldStartIndex + ' of ' + campaignIds.length, 'INFO');
+    }
+
       for (let c = coldStartIndex; c < campaignIds.length; c++) {
       const campaignId    = campaignIds[c];
 
@@ -198,15 +211,22 @@ function distributeCold() {
           }
         }
 
+        // These requests have now been fired. Drop them so that if the checkpoint
+        // save fails below and execution continues, the final fan-out cannot POST
+        // them a second time and write duplicate rows into sender inboxes.
+        allFetchRequests.length = 0;
+        allFetchMeta.length     = 0;
+
         // Write DB updates so far
         if (dbUpdates.length > 0) {
           batchUpdateLeadsDB(leadsSheetId, dbUpdates);
           log('distributeCold: partial DB update — wrote ' + dbUpdates.length + ' leads before checkpoint', 'INFO');
         }
 
-        // Save only small checkpoint — just the index
+        // Save only small checkpoint — campaignId is what we resume on
         const saved = saveCheckpointAndChain_('distributeCold', {
-          campaignIndex: c
+          campaignIndex: c,
+          campaignId:    campaignId
         });
         if (saved) { return; }
         log('distributeCold: checkpoint save failed — continuing anyway', 'WARN');
@@ -216,6 +236,16 @@ function distributeCold() {
 
       if (!campSettings) {
         log('distributeCold: no settings found for campaign ' + campaignId + ' — skipping', 'WARN');
+        continue;
+      }
+
+      // The campaign's OWN status is authoritative. handleUploadLeads stamps every
+      // new lead with campaignStatus='Active' no matter what the campaign says, so
+      // without this a Paused or Deleted campaign would still send.
+      // Blank is treated as Active so existing campaigns keep working.
+      const campStatus = String(campSettings.campaignStatus || '').trim();
+      if (campStatus && campStatus !== 'Active') {
+        log('distributeCold: campaign ' + campaignId + ' is ' + campStatus + ' — skipping', 'INFO');
         continue;
       }
       // Skip distribution on non-sending days
@@ -248,7 +278,8 @@ function distributeCold() {
       }
 
       // Use campaign coldPriorityLimit or fall back to global
-      const coldPriorityLimit = campSettings.coldPriorityLimit || globalColdLimit;
+      const coldPriorityLimit     = campSettings.coldPriorityLimit     || globalColdLimit;
+      const followupPriorityLimit = campSettings.followupPriorityLimit || globalFollowupLimit;
 
       // Calculate cold slots per sender for this campaign
       const sendersWithSlots = campaignSenders.map(function(sender) {
@@ -278,7 +309,14 @@ function distributeCold() {
         bonusColdSlots               = Math.max(0, followupCeiling - existingFollowupQueued);
       }
 
-      const availableSlots = Math.max(0, finalColdSlots + bonusColdSlots - existingColdQueued - usedSlots);
+      // Hard ceiling — never hand out more than the sender can still send today.
+      // dailyLimit covers cold + followups together.
+      const roomLeft = Math.max(0, sender.availableCapacity
+                                   - existingColdQueued
+                                   - (sender.existingFollowupQueued || 0)
+                                   - usedSlots);
+      const wantSlots      = Math.max(0, finalColdSlots + bonusColdSlots - existingColdQueued - usedSlots);
+      const availableSlots = Math.min(roomLeft, wantSlots);
 
       log('distributeCold: sender=' + sender.emailID +
           ' dailyLimit=' + sender.dailyLimit +
@@ -369,11 +407,6 @@ function distributeCold() {
               }
             });
           });
-
-          const masterSender = allSendersMap[meta.senderId];
-          if (masterSender) {
-            masterSender.usedColdSlots = (masterSender.usedColdSlots || 0) + meta.assignedLeads.length;
-          }
           log('distributeCold: wrote ' + meta.inboxRows.length + ' rows to sender ' + meta.senderId, 'INFO');
         } else {
           log('distributeCold: webhook failed (' + code + ') for sender ' + meta.senderId, 'ERROR');
@@ -388,9 +421,19 @@ function distributeCold() {
     }
 
     log('distributeCold: completed successfully', 'INFO');
-    // Kick off sending chain immediately on all assigned senders
-    log('distributeCold: kicking off send chains on all senders', 'INFO');
-    fanOutToSenders_('kickoffCold', 'distributeCold');
+
+    // Kick off sending chain on all assigned senders.
+    // Each sender runs scheduleDailySends() synchronously inside this POST, so at
+    // 200-300 senders this fan-out costs 60-120s+ on its own. There is no
+    // checkpoint past this point — if we run out of budget here the execution is
+    // killed and the remaining batches never get kicked off at all. Defer instead.
+    if (isTimeLimitApproaching_()) {
+      log('distributeCold: no execution budget left for kickoff — deferring to a one-time trigger', 'WARN');
+      scheduleDeferredKickoff_('kickoffColdChainsDeferred');
+    } else {
+      log('distributeCold: kicking off send chains on all senders', 'INFO');
+      fanOutToSenders_('kickoffCold', 'distributeCold');
+    }
 
   } catch (e) {
     log('distributeCold: unexpected error — ' + e.message, 'ERROR');
@@ -461,10 +504,11 @@ function distributeFollowups() {
 
   startExecutionTimer_();
 
-  const followupCheckpoint = loadCheckpoint_('distributeFollowups');
-  const followupStartIndex = followupCheckpoint ? (followupCheckpoint.campaignIndex || 0) : 0;
-  if (followupStartIndex > 0) {
-    log('distributeFollowups: resuming from campaign index ' + followupStartIndex, 'INFO');
+  // Resume by campaignId, NOT by index — see the note in distributeCold().
+  const followupCheckpoint     = loadCheckpoint_('distributeFollowups');
+  const followupResumeCampaign = followupCheckpoint ? String(followupCheckpoint.campaignId || '') : '';
+  if (followupResumeCampaign) {
+    log('distributeFollowups: resuming from campaign ' + followupResumeCampaign, 'INFO');
   }
 
   if (!acquireLock(LOCK_WAIT_SECONDS)) {
@@ -557,6 +601,16 @@ function distributeFollowups() {
 
     // --- Step 5: Distribute per campaign ---
     const campaignIds = Object.keys(leadsByCampaign).sort();
+
+    // Map the checkpointed campaignId back onto the freshly-read campaign list
+    let followupStartIndex = 0;
+    if (followupResumeCampaign) {
+      const followupResumeAt = campaignIds.indexOf(followupResumeCampaign);
+      followupStartIndex = followupResumeAt >= 0 ? followupResumeAt : 0;
+      log('distributeFollowups: resume campaign ' + followupResumeCampaign +
+          ' resolved to index ' + followupStartIndex + ' of ' + campaignIds.length, 'INFO');
+    }
+
       for (let c = followupStartIndex; c < campaignIds.length; c++) {
       const campaignId    = campaignIds[c];
 
@@ -585,15 +639,21 @@ function distributeFollowups() {
           }
         }
 
+        // Already fired — drop them so a failed checkpoint save cannot cause the
+        // final fan-out to POST the same rows twice.
+        allFetchRequests.length = 0;
+        allFetchMeta.length     = 0;
+
         // Write DB updates so far
         if (dbUpdates.length > 0) {
           batchUpdateLeadsDB(leadsSheetId, dbUpdates);
           log('distributeFollowups: partial DB update — wrote ' + dbUpdates.length + ' leads before checkpoint', 'INFO');
         }
 
-        // Save only small checkpoint
+        // Save only small checkpoint — campaignId is what we resume on
         const saved = saveCheckpointAndChain_('distributeFollowups', {
-          campaignIndex: c
+          campaignIndex: c,
+          campaignId:    campaignId
         });
         if (saved) { return; }
         log('distributeFollowups: checkpoint save failed — continuing anyway', 'WARN');
@@ -603,6 +663,12 @@ function distributeFollowups() {
 
       if (!campSettings) {
         log('distributeFollowups: no settings for campaign ' + campaignId + ' — skipping', 'WARN');
+        continue;
+      }
+      // Same authoritative campaign-status gate as distributeCold — see note there.
+      const campStatus = String(campSettings.campaignStatus || '').trim();
+      if (campStatus && campStatus !== 'Active') {
+        log('distributeFollowups: campaign ' + campaignId + ' is ' + campStatus + ' — skipping', 'INFO');
         continue;
       }
       // Skip distribution on non-sending days
@@ -661,7 +727,11 @@ function distributeFollowups() {
         bonusSlots          = Math.max(0, coldCeiling - usedColdSlots);
       }
 
-      const followupSlots = Math.max(0, finalFollowupSlots + bonusSlots - existingQueued);
+      const roomLeft = Math.max(0, sender.availableCapacity
+                                   - (sender.existingColdQueued || 0)
+                                   - existingQueued);
+      const wantSlots     = Math.max(0, finalFollowupSlots + bonusSlots - existingQueued);
+      const followupSlots = Math.min(roomLeft, wantSlots);
 
       log('distributeFollowups: sender=' + sender.emailID +
           ' dailyLimit=' + sender.dailyLimit +
@@ -762,8 +832,15 @@ function distributeFollowups() {
     }
 
     log('distributeFollowups: completed successfully', 'INFO');
-    log('distributeFollowups: kicking off followup chains on all senders', 'INFO');
-    fanOutToSenders_('kickoffFollowup', 'distributeFollowups');
+
+    // Same budget guard as distributeCold — see the note there.
+    if (isTimeLimitApproaching_()) {
+      log('distributeFollowups: no execution budget left for kickoff — deferring to a one-time trigger', 'WARN');
+      scheduleDeferredKickoff_('kickoffFollowupChainsDeferred');
+    } else {
+      log('distributeFollowups: kicking off followup chains on all senders', 'INFO');
+      fanOutToSenders_('kickoffFollowup', 'distributeFollowups');
+    }
 
   } catch (e) {
     log('distributeFollowups: unexpected error — ' + e.message, 'ERROR');
@@ -1402,6 +1479,55 @@ function deleteOwnContinuationTrigger_(handlerName) {
 
 
 // new function 
+
+/**
+ * Creates a one-time trigger for a deferred sender fan-out.
+ * Used when a distribution run has no execution budget left to fan out inline.
+ *
+ * @param {string} handlerName - Function to run in a fresh execution.
+ * @returns {boolean} true if the trigger was created.
+ */
+function scheduleDeferredKickoff_(handlerName) {
+  try {
+    ScriptApp.newTrigger(handlerName)
+      .timeBased()
+      .after(60 * 1000)
+      .create();
+    log('scheduleDeferredKickoff_: ' + handlerName + ' scheduled in 1 min', 'INFO');
+    return true;
+  } catch (e) {
+    log('scheduleDeferredKickoff_: could not schedule ' + handlerName + ' — ' + e.message, 'ERROR');
+    return false;
+  }
+}
+
+/**
+ * Deferred cold kickoff. Runs in its own execution with a full 6-minute budget.
+ */
+function kickoffColdChainsDeferred() {
+  deleteOwnContinuationTrigger_('kickoffColdChainsDeferred');
+  fanOutToSenders_('kickoffCold', 'kickoffColdChainsDeferred');
+}
+
+/**
+ * Deferred followup kickoff. Runs in its own execution with a full 6-minute budget.
+ */
+function kickoffFollowupChainsDeferred() {
+  deleteOwnContinuationTrigger_('kickoffFollowupChainsDeferred');
+  fanOutToSenders_('kickoffFollowup', 'kickoffFollowupChainsDeferred');
+}
+
+function runDistributeColdNow() {
+  deleteOwnContinuationTrigger_('runDistributeColdNow');
+  log('runDistributeColdNow: manual cold distribution requested via API', 'INFO');
+  distributeCold();
+}
+
+function runDistributeFollowupsNow() {
+  deleteOwnContinuationTrigger_('runDistributeFollowupsNow');
+  log('runDistributeFollowupsNow: manual followup distribution requested via API', 'INFO');
+  distributeFollowups();
+}
 
 /**
  * Continuation trigger for distributeCold.
