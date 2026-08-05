@@ -143,6 +143,7 @@ function distributeCold() {
           if (sender) {
             sender.existingColdQueued     = status.coldQueued     || 0;
             sender.existingFollowupQueued = status.followupQueued || 0;
+            sender.statusKnown            = true;
           }
         } catch(e) { continue; }
       }
@@ -283,10 +284,17 @@ function distributeCold() {
 
       // Calculate cold slots per sender for this campaign
       const sendersWithSlots = campaignSenders.map(function(sender) {
+      // Its webApp never answered, so the real queue depth is unknown. Give it
+      // nothing this run rather than guessing that it is empty.
+      if (!sender.statusKnown) {
+        log('distributeCold: sender=' + sender.emailID + ' queue unknown — skipped this run', 'WARN');
+        return Object.assign({}, sender, { coldSlots: 0 });
+      }
+
       const rawColdSlots       = Math.floor(sender.dailyLimit * coldPriorityLimit);
       const rawFollowupSlots   = Math.floor(sender.dailyLimit * followupPriorityLimit);
       const existingColdQueued = sender.existingColdQueued || 0;
-      const usedSlots          = sender.usedColdSlots || 0;
+      const usedSlots          = sender.assignedColdThisRun || 0;
 
       // Calculate wasted slots and give to priority holder
       const totalRaw   = rawColdSlots + rawFollowupSlots;
@@ -341,8 +349,16 @@ function distributeCold() {
       // Build all requests for this campaign first — fire them all at once
 
       assignments.forEach(function(assignedLeads, senderId) {
-        const sender = sendersWithSlots.find(function(s) { return s.emailID === senderId; });
+      const sender = sendersWithSlots.find(function(s) { return s.emailID === senderId; });
         if (!sender) { return; }
+
+        // Charge these leads against this run's running total, so the next
+        // campaign in the loop sees the reduced capacity.
+        const runningSender = allSendersMap[senderId];
+        if (runningSender) {
+          runningSender.assignedColdThisRun =
+            (runningSender.assignedColdThisRun || 0) + assignedLeads.length;
+        }
 
         const inboxRows = assignedLeads.map(function(lead) {
           return {
@@ -705,9 +721,15 @@ function distributeFollowups() {
       const coldPriorityLimit     = campSettings.coldPriorityLimit     || globalColdLimit;
 
       const sendersWithSlots = campaignSenders.map(function(sender) {
+      if (!sender.statusKnown) {
+        log('distributeFollowups: sender=' + sender.emailID + ' queue unknown — skipped this run', 'WARN');
+        return Object.assign({}, sender, { followupSlots: 0 });
+      }
+
       const rawColdSlots      = Math.floor(sender.dailyLimit * coldPriorityLimit);
       const rawFollowupSlots  = Math.floor(sender.dailyLimit * followupPriorityLimit);
-      const existingQueued    = sender.existingFollowupQueued || 0;
+      const existingQueued    = (sender.existingFollowupQueued || 0) +
+                                (sender.assignedFollowupThisRun || 0);
 
       // Wasted slots go to followup if followup has higher priority
       const totalRaw              = rawColdSlots + rawFollowupSlots;
@@ -754,8 +776,14 @@ function distributeFollowups() {
       // Build all requests for this campaign first — fire them all at once
 
       assignments.forEach(function(assignedLeads, senderId) {
-        const sender = sendersWithSlots.find(function(s) { return s.emailID === senderId; });
+      const sender = sendersWithSlots.find(function(s) { return s.emailID === senderId; });
         if (!sender) { return; }
+
+        const runningSender = allSendersMap[senderId];
+        if (runningSender) {
+          runningSender.assignedFollowupThisRun =
+            (runningSender.assignedFollowupThisRun || 0) + assignedLeads.length;
+        }
 
         const inboxRows = assignedLeads.map(function(lead) {
           return {
