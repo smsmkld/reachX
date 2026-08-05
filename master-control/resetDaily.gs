@@ -70,25 +70,68 @@ function runDailyReset() {
       return;
     }
 
-    // --- Step 2: Aggregate daily totals ---
+        // --- Step 2: Aggregate daily totals ---
+    // These three come from senderAccounts and are reset in step 4, so they are
+    // read here while they still hold the whole day.
     let totalInitialSent  = 0;
     let totalFollowupSent = 0;
     let totalErrors       = 0;
 
     let totalSent = 0;
     for (let i = 0; i < senders.length; i++) {
-      totalSent += senders[i].sentToday || 0;
+      totalSent         += senders[i].sentToday         || 0;
+      totalInitialSent  += senders[i].initialSentToday  || 0;
+      totalFollowupSent += senders[i].followupSentToday || 0;
+      totalErrors       += senders[i].errorsToday       || 0;
     }
+
+    // The cold/followup split needs these two columns on senderAccounts. Without
+    // them everything lands in initialSent below, which reads as "no follow-ups
+    // were ever sent" — say so rather than publishing a misleading split.
+    const headerSet = {};
+    (senderHeaders || []).forEach(function(h) { headerSet[String(h).trim()] = true; });
+    const splitCols = ['initialSentToday', 'followupSentToday'].filter(function(c) {
+      return !headerSet[c];
+    });
+    if (splitCols.length > 0) {
+      log('runDailyReset: senderAccounts has no ' + splitCols.join(' / ') +
+          ' column — dailySummary cannot split cold from follow-ups. Add them to fix.', 'WARN');
+    }
+
+    // A sender running an older webApp does not split cold from followups, so
+    // the two parts can add up to less than the total. Attribute the remainder
+    // to cold rather than publishing a row that does not reconcile.
+    if (totalInitialSent + totalFollowupSent < totalSent) {
+      totalInitialSent = totalSent - totalFollowupSent;
+    }
+
+    // --- Step 2b: Lead-side and campaign-side numbers ---
+    const leadCounts   = countLeadStatsForSummary_();
+    const activeCamps  = countActiveCampaigns_();
 
     // --- Step 3: Write daily summary row ---
     writeDailySummaryRow({
-      date:           formatDate(new Date()),
-      totalSent:      totalSent,
-      initialSent:    totalInitialSent,
-      followupsSent:  totalFollowupSent,
-      errors:         totalErrors,
-      activeSenders:  senders.length
+      date:            formatDate(new Date()),
+      totalSent:       totalSent,
+      initialSent:     totalInitialSent,
+      followupsSent:   totalFollowupSent,
+      errors:          totalErrors,
+      activeSenders:   senders.length,
+      repliesReceived: leadCounts.repliesToday,
+      bouncedEmails:   leadCounts.bouncesToday,
+      pendingLeads:    leadCounts.pending,
+      activeCampaigns: activeCamps,
+      notes:           totalErrors > 0 ? totalErrors + ' send error(s) today' : ''
     });
+
+    // Commit the reply/bounce watermark only now the row is on the sheet, so a
+    // failed write leaves the delta to be picked up by tomorrow's run.
+    if (leadCounts.replyTotal !== undefined) {
+      setSettingsValues_({
+        lastSummaryReplyTotal:  String(leadCounts.replyTotal),
+        lastSummaryBounceTotal: String(leadCounts.bounceTotal || 0)
+      });
+    }
 
     // --- Step 4: Reset daily counters for all active senders ---
     resetSenderDailyCounters(senderSheet, senderData, senderHeaders, senders);
@@ -322,6 +365,19 @@ function readSenderAccountsForReset() {
  * dailySummary sheet columns:
  *   date | totalSent | initialSent | followupsSent | errors | activeSenders
  */
+var SUMMARY_FIELD_MAP = {
+  date:            'date',
+  totalSent:       'emailsSent',
+  initialSent:     'initialSent',
+  followupsSent:   'followupsSent',
+  repliesReceived: 'repliesReceived',
+  pendingLeads:    'pendingLeads',
+  activeSenders:   'activeSenders',
+  activeCampaigns: 'activeCampaigns',
+  bouncedEmails:   'bouncedEmails',
+  notes:           'notes'
+};
+
 function writeDailySummaryRow(summary) {
   const ss    = SpreadsheetApp.openById(MASTER_SHEET_ID);
   let   sheet = ss.getSheetByName(DAILY_SUMMARY_SHEET);
@@ -332,7 +388,7 @@ function writeDailySummaryRow(summary) {
     const summaryHeaders = [
       'date', 'emailsSent', 'initialSent', 'followupsSent',
       'repliesReceived', 'pendingLeads', 'activeSenders', 'activeCampaigns', 'bouncedEmails', 'notes'
-    ]; // HARDCODED — verify this
+    ];
     sheet.getRange(1, 1, 1, summaryHeaders.length).setValues([summaryHeaders]);
 
     // Style header
@@ -345,22 +401,39 @@ function writeDailySummaryRow(summary) {
     log('writeDailySummaryRow: created dailySummary sheet with headers', 'INFO');
   }
 
-  // Append summary row
-  sheet.appendRow([
-    summary.date,
-    summary.totalSent,
-    summary.initialSent,
-    summary.followupsSent,
-    summary.repliesReceived  || 0,
-    summary.pendingLeads     || 0,
-    summary.activeSenders,
-    summary.activeCampaigns  || 0,
-    summary.bouncedEmails    || 0,
-    summary.notes            || ''
-  ]);
+  const lastCol  = Math.max(1, sheet.getLastColumn());
+  const headers  = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const col      = {};
+  headers.forEach(function(h, i) { col[String(h).trim()] = i; });
 
+  const row     = new Array(headers.length).fill('');
+  const unknown = [];
+
+  Object.keys(SUMMARY_FIELD_MAP).forEach(function(key) {
+    const header = SUMMARY_FIELD_MAP[key];
+    const value  = summary[key];
+    if (!(header in col)) { unknown.push(header); return; }
+    // Empty string for notes, 0 for every counter — never blank a number.
+    row[col[header]] = (value === undefined || value === null)
+      ? (header === 'notes' || header === 'date' ? '' : 0)
+      : value;
+  });
+
+  if (unknown.length > 0) {
+    log('writeDailySummaryRow: dailySummary has no column(s) ' + unknown.join(', ') +
+        ' — those values were not recorded', 'WARN');
+  }
+
+  sheet.getRange(sheet.getLastRow() + 1, 1, 1, headers.length).setValues([row]);
   SpreadsheetApp.flush();
-  log('writeDailySummaryRow: appended summary for ' + summary.date, 'INFO');
+  log('writeDailySummaryRow: appended summary for ' + summary.date +
+      ' — sent=' + summary.totalSent +
+      ' cold=' + summary.initialSent +
+      ' followup=' + summary.followupsSent +
+      ' replies=' + summary.repliesReceived +
+      ' bounces=' + summary.bouncedEmails +
+      ' pending=' + summary.pendingLeads +
+      ' campaigns=' + summary.activeCampaigns, 'INFO');
 }
 
 
@@ -522,4 +595,150 @@ function setupSyncStatsTrigger() {
     .inTimezone('Africa/Cairo')
     .create();
   log('setupSyncStatsTrigger: created 11:30 PM trigger', 'INFO');
+}
+/**
+ * Numbers for the daily summary that do not live on senderAccounts.
+ *
+ * pendingLeads is a straight count of masterLeads.
+ *
+ * Replies and bounces are deliberately NOT counted by matching replyDate /
+ * bounceDate against today. Those columns hold the date of the message, but
+ * detection happens in the next morning's scan — a reply that arrived at 9am
+ * is stamped with that day and only discovered after that day's summary row was
+ * already written, so a date match would miss it permanently. Instead this
+ * takes the delta on the cumulative senderAccounts counters since the last
+ * reset, which is exactly "detected today" and can neither miss nor double count.
+ *
+ * @returns {{ pending: number, repliesToday: number, bouncesToday: number }}
+ */
+function countLeadStatsForSummary_() {
+  const out = { pending: 0, repliesToday: 0, bouncesToday: 0 };
+
+  // ── Pending leads ────────────────────────────────────────────────────────
+  try {
+    const settings     = getSettings(MASTER_SHEET_ID);
+    const leadsSheetId = settings.leadsSpreadsheetId;
+    if (leadsSheetId) {
+      const sheet = SpreadsheetApp.openById(leadsSheetId).getSheetByName(LEADS_SHEET_NAME);
+      if (sheet && sheet.getLastRow() > 1) {
+        const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+        const data    = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+        const col     = {};
+        headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+        for (let i = 0; i < data.length; i++) {
+          if (String(data[i][col['status']] || '').trim() === 'Pending') { out.pending++; }
+        }
+      }
+    }
+  } catch (e) {
+    log('countLeadStatsForSummary_: could not count pending leads — ' + e.message, 'WARN');
+  }
+
+  // ── Replies / bounces detected since the last reset ──────────────────────
+  try {
+    const ss    = SpreadsheetApp.openById(MASTER_SHEET_ID);
+    const sheet = ss.getSheetByName(SHEET_SENDER_ACCOUNTS);
+    if (!sheet || sheet.getLastRow() < 2) { return out; }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const data    = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    const col     = {};
+    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+
+    // Every row, not just active ones — pausing a sender must not make the
+    // running total drop and turn the next delta negative.
+    let replyTotal = 0, bounceTotal = 0;
+    for (let i = 0; i < data.length; i++) {
+      if ('repliesReceived' in col) { replyTotal  += parseInt(data[i][col['repliesReceived']] || 0, 10); }
+      if ('bouncedEmails'   in col) { bounceTotal += parseInt(data[i][col['bouncedEmails']]   || 0, 10); }
+    }
+
+    const settings   = getSettings(MASTER_SHEET_ID);
+    const lastReply  = parseInt(settings.lastSummaryReplyTotal  || 0, 10) || 0;
+    const lastBounce = parseInt(settings.lastSummaryBounceTotal || 0, 10) || 0;
+
+    // Clamped at 0: a deleted sender or a hand-edited counter can move the
+    // running total backwards, and a negative day would corrupt the chart.
+    out.repliesToday = Math.max(0, replyTotal  - lastReply);
+    out.bouncesToday = Math.max(0, bounceTotal - lastBounce);
+
+    // The caller commits these once the row is safely on the sheet. Advancing
+    // the watermark here would lose a day's replies if the write then failed.
+    out.replyTotal  = replyTotal;
+    out.bounceTotal = bounceTotal;
+
+  } catch (e) {
+    log('countLeadStatsForSummary_: could not compute reply/bounce delta — ' + e.message, 'WARN');
+  }
+
+  return out;
+}
+
+
+/**
+ * Counts distinct campaigns whose status is Active.
+ * Campaigns holds one row per sequence step, so rows are grouped by campaignId
+ * first — otherwise a 4-step campaign would report as four active campaigns.
+ *
+ * @returns {number}
+ */
+function countActiveCampaigns_() {
+  try {
+    const sheet = SpreadsheetApp.openById(MASTER_SHEET_ID).getSheetByName(SHEET_CAMPAIGNS);
+    if (!sheet || sheet.getLastRow() < 2) { return 0; }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const data    = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    const col     = {};
+    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+
+    const seen = {};
+    for (let i = 0; i < data.length; i++) {
+      const id     = String(data[i][col['campaignId']]     || '').trim();
+      const status = String(data[i][col['campaignStatus']] || '').trim();
+      if (id && status === 'Active') { seen[id] = true; }
+    }
+    return Object.keys(seen).length;
+
+  } catch (e) {
+    log('countActiveCampaigns_: error — ' + e.message, 'WARN');
+    return 0;
+  }
+}
+
+
+/**
+ * Writes key/value pairs into the Settings sheet, creating missing keys.
+ * Internal only — handleUpdateSettings stays the gated path for anything a UI
+ * can change. This is for counters the system manages itself.
+ *
+ * @param {Object} updates - { settingName: stringValue, ... }
+ */
+function setSettingsValues_(updates) {
+  try {
+    const sheet = SpreadsheetApp.openById(MASTER_SHEET_ID).getSheetByName(SHEET_SETTINGS);
+    if (!sheet) {
+      log('setSettingsValues_: Settings sheet not found', 'ERROR');
+      return;
+    }
+
+    const lastRow = Math.max(1, sheet.getLastRow());
+    const data    = sheet.getRange(1, 1, lastRow, 2).getValues();
+    const rowOf   = {};
+    data.forEach(function(r, i) {
+      const k = String(r[0]).trim();
+      if (k) { rowOf[k] = i; }
+    });
+
+    Object.keys(updates).forEach(function(key) {
+      if (key in rowOf) { data[rowOf[key]][1] = updates[key]; }
+      else              { data.push([key, updates[key]]); }
+    });
+
+    sheet.getRange(1, 1, data.length, 2).setValues(data);
+    SpreadsheetApp.flush();
+
+  } catch (e) {
+    log('setSettingsValues_: error — ' + e.message, 'ERROR');
+  }
 }
