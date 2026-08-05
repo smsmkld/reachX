@@ -111,7 +111,10 @@ function syncCampaignStats(masterSheetId, leadsSheetId) {
     // Read masterLeads once
     const leadsSS    = SpreadsheetApp.openById(leadsSheetId);
     const leadsSheet = leadsSS.getSheetByName('masterLeads');
-    if (!leadsSheet || leadsSheet.getLastRow() < 2) { return; }
+        if (!leadsSheet) { return; }
+    // An empty masterLeads is a real state, not a reason to skip: every
+    // campaign should then report zero rather than keep its last numbers.
+    const hasLeadRows = leadsSheet.getLastRow() >= 2;
 
     const leadsHeaders = leadsSheet.getRange(1, 1, 1, leadsSheet.getLastColumn()).getValues()[0];
     const leadsData    = leadsSheet.getRange(2, 1, leadsSheet.getLastRow() - 1, leadsSheet.getLastColumn()).getValues();
@@ -127,9 +130,16 @@ function syncCampaignStats(masterSheetId, leadsSheetId) {
       const bounceStatus = String(leadsData[i][lCol['bounceStatus']] || '').trim();
 
       if (!stats[cId]) {
-        stats[cId] = { totalLeads: 0, sentCount: 0, replyCount: 0, pendingCount: 0, bouncedEmails: 0 };
+        stats[cId] = { totalLeads: 0, sentCount: 0, replyCount: 0, pendingCount: 0,
+                      bouncedEmails: 0, stepsSent: 0, contactedCount: 0 };
       }
       stats[cId].totalLeads++;
+      // Every step delivered, so follow-ups move the progress bar too.
+      const step = parseInt(leadsData[i][lCol['sequenceStep']] || 0, 10);
+      if (step > 0) {
+        stats[cId].stepsSent += step;
+        stats[cId].contactedCount++;    // counted once per lead, not per send
+      }
       if (status === 'Sent' || status === 'Completed')  { stats[cId].sentCount++;    }
       if (replyStatus === 'Replied')                    { stats[cId].replyCount++;   }
       if (status === 'Pending')                         { stats[cId].pendingCount++; }
@@ -150,14 +160,20 @@ function syncCampaignStats(masterSheetId, leadsSheetId) {
 
     for (let i = 0; i < campData.length; i++) {
       const cId = String(campData[i][cCol['campaignId']] || '').trim();
-      if (!cId || !stats[cId]) { continue; }
+      if (!cId) { continue; }
 
-      const s = stats[cId];
+      // A campaign with no leads left is absent from stats. Treat that as
+      // zeros instead of skipping the row, or its counters freeze forever.
+      const s = stats[cId] || {
+        totalLeads: 0, sentCount: 0, replyCount: 0, pendingCount: 0, bouncedEmails: 0
+      };
       if ('totalLeads'   in cCol) { campData[i][cCol['totalLeads']]   = s.totalLeads;   }
       if ('sentCount'    in cCol) { campData[i][cCol['sentCount']]    = s.sentCount;    }
       if ('replyCount'   in cCol) { campData[i][cCol['replyCount']]   = s.replyCount;   }
       if ('pendingCount' in cCol) { campData[i][cCol['pendingCount']] = s.pendingCount; }
       if ('bouncedEmails' in cCol) { campData[i][cCol['bouncedEmails']] = s.bouncedEmails; }
+      if ('stepsSent'      in cCol) { campData[i][cCol['stepsSent']]      = s.stepsSent; }
+      if ('contactedCount' in cCol) { campData[i][cCol['contactedCount']] = s.contactedCount; }
       if ('lastModified' in cCol) { campData[i][cCol['lastModified']] = today;          }
 
       // Set createdDate only if it is currently empty
