@@ -206,6 +206,15 @@ function doPost(e) {
     if (action === 'validateSystem') {
       return buildResponse(handleValidateSystem(params), corsHeaders);
     }
+    if (action === 'checkSenderChains') {
+      return buildResponse(handleCheckSenderChains(params), corsHeaders);
+    }
+    if (action === 'restartSenderChain') {
+      return buildResponse(handleRestartSenderChain(params), corsHeaders);
+    }
+    if (action === 'syncStats') {
+      return buildResponse(handleSyncStats(params), corsHeaders);
+    }
     if (action === 'sendDailyDigest') {
       return buildResponse(handleSendDailyDigest(params), corsHeaders);
     }
@@ -308,6 +317,24 @@ function doPost(e) {
     log('doPost: uncaught error — ' + e.message, 'ERROR');
     return buildResponse({ success: false, error: 'Internal server error: ' + e.message }, corsHeaders);
   }
+}
+
+/**
+ * Answers GET requests with JSON instead of failing.
+ *
+ * Without it, every browser visit to /exec is a failed execution in the log.
+ * It deliberately exposes nothing: no spreadsheet IDs, no settings, no data —
+ * only enough to confirm the deployment is reachable and serving JSON.
+ */
+function doGet(e) {
+  return ContentService
+    .createTextOutput(JSON.stringify({
+      success: true,
+      service: 'reachx-master-control',
+      message: 'This endpoint is alive. Actions are POST-only.',
+      time:    new Date().toISOString()
+    }))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 
@@ -2221,6 +2248,11 @@ function handleUploadLeads(params) {
       if ('phoneNumber'        in col) { row[col['phoneNumber']]        = sanitize(lead.phoneNumber    || ''); }
       if ('city'               in col) { row[col['city']]               = sanitize(lead.city           || ''); }
       if ('country'            in col) { row[col['country']]            = sanitize(lead.country        || ''); }
+      if ('addressLine'        in col) { row[col['addressLine']]        = sanitize(lead.addressLine        || ''); }
+      if ('state'              in col) { row[col['state']]              = sanitize(lead.state              || ''); }
+      if ('countryCode'        in col) { row[col['countryCode']]        = sanitize(lead.countryCode        || ''); }
+      if ('linkedinPersonUrl'  in col) { row[col['linkedinPersonUrl']]  = sanitize(lead.linkedinPersonUrl  || ''); }
+      if ('linkedinCompanyUrl' in col) { row[col['linkedinCompanyUrl']] = sanitize(lead.linkedinCompanyUrl || ''); }
       if ('customVar1'         in col) { row[col['customVar1']]         = sanitize(lead.customVar1     || ''); }
       if ('customVar2'         in col) { row[col['customVar2']]         = sanitize(lead.customVar2     || ''); }
       if ('customVar3'         in col) { row[col['customVar3']]         = sanitize(lead.customVar3     || ''); }
@@ -2242,6 +2274,14 @@ function handleUploadLeads(params) {
         ' skippedOtherCamp=' + skippedOtherCamp.length +
         ' skippedNoEmail='   + skippedNoEmail.length, 'INFO');
 
+  // Reflect the upload now rather than at 11:30 PM.
+    try {
+      syncCampaignStats(MASTER_SHEET_ID, leadsSheetId);
+    } catch (e) {
+      log('handleUploadLeads: stats resync failed — ' + e.message, 'WARN');
+    }
+
+
     return {
       success:          true,
       campaignId:       campaignId,
@@ -2249,7 +2289,7 @@ function handleUploadLeads(params) {
       skippedDuplicate: skippedDuplicate.length,
       skippedOtherCamp: skippedOtherCamp.length,
       skippedNoEmail:   skippedNoEmail.length,
-      kippedBlocklist: skippedBlocklist.length,
+      skippedBlocklist: skippedBlocklist.length,
       totalReceived:    leads.length
     };
 
@@ -2284,8 +2324,8 @@ function handleGetCampaigns(params) {
           campaignStatus:      String(data[i][col['campaignStatus']]      || '').trim(),
           totalSequenceSteps:  parseInt(data[i][col['totalSequenceSteps']] || 1, 10),
           assignedSenders:     String(data[i][col['assignedSenders']]     || '').trim(),
-          windowStart:         String(data[i][col['windowStart']]         || '').trim(),
-          windowEnd:           String(data[i][col['windowEnd']]           || '').trim(),
+          windowStart:         formatTimeValue_(data[i][col['windowStart']]),
+          windowEnd:           formatTimeValue_(data[i][col['windowEnd']]),
           sendingDays:         String(data[i][col['sendingDays']]         || '').trim(),
           timezone:            String(data[i][col['timezone']]            || '').trim(),
           totalLeads:          parseInt(data[i][col['totalLeads']]        || 0, 10),
@@ -2293,7 +2333,13 @@ function handleGetCampaigns(params) {
           replyCount:          parseInt(data[i][col['replyCount']]        || 0, 10),
           pendingCount:        parseInt(data[i][col['pendingCount']]      || 0, 10),
           bouncedEmails:       parseInt(data[i][col['bouncedEmails']]     || 0, 10),
+          stepsSent:           parseInt(data[i][col['stepsSent']]         || 0, 10),
+          contactedCount:      parseInt(data[i][col['contactedCount']]    || 0, 10),
           createdDate:         String(data[i][col['createdDate']]         || '').trim(),
+          notes:                 String(data[i][col['notes']]                || '').trim(),
+          coldPriorityLimit:     parseFloat(data[i][col['coldPriorityLimit']])     || null,
+          followupPriorityLimit: parseFloat(data[i][col['followupPriorityLimit']]) || null,
+          notes:               String(data[i][col['notes']]               || '').trim(),
           steps:               []
         };
       }
@@ -2433,62 +2479,274 @@ function handleUpdateCampaign(params) {
   const campaignId = String(params.campaignId || '').trim();
   if (!campaignId) { return { success: false, error: 'Missing campaignId' }; }
 
+  if (!acquireLock(30)) {
+    return { success: false, error: 'Busy — could not acquire lock' };
+  }
+
   try {
     const ss      = SpreadsheetApp.openById(MASTER_SHEET_ID);
     const sheet   = ss.getSheetByName('Campaigns');
     const lastRow = sheet.getLastRow();
+    if (lastRow < 2) { return { success: false, error: 'No campaigns found' }; }
+
     const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     const data    = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
     const col     = {};
     headers.forEach(function(h, i) { col[String(h).trim()] = i; });
 
-    let updatedCount = 0;
-
+    // Split the sheet into this campaign's rows and everyone else's.
+    const mine   = [];
+    const others = [];
     for (let i = 0; i < data.length; i++) {
-      const rowCampaignId = String(data[i][col['campaignId']] || '').trim();
-      if (rowCampaignId !== campaignId) { continue; }
+      const rowId = String(data[i][col['campaignId']] || '').trim();
+      (rowId === campaignId ? mine : others).push(data[i]);
+    }
+    if (mine.length === 0) {
+      return { success: false, error: 'Campaign not found: ' + campaignId };
+    }
 
-      const step = parseInt(data[i][col['sequenceStep']] || 1, 10);
+    mine.sort(function(a, b) {
+      return (parseInt(a[col['sequenceStep']] || 1, 10)) -
+             (parseInt(b[col['sequenceStep']] || 1, 10));
+    });
 
-      // Update global campaign fields on ALL rows
-      if (params.campaignName    !== undefined && 'campaignName' in col) { data[i][col['campaignName']] = params.campaignName; }
-      if (params.campaignStatus  !== undefined) { data[i][col['campaignStatus']]  = params.campaignStatus; }
-      if (params.windowStart     !== undefined) { data[i][col['windowStart']]     = params.windowStart; }
-      if (params.windowEnd       !== undefined) { data[i][col['windowEnd']]       = params.windowEnd; }
-      if (params.sendingDays     !== undefined) { data[i][col['sendingDays']]     = params.sendingDays; }
-      if (params.timezone        !== undefined) { data[i][col['timezone']]        = params.timezone; }
-      if (params.assignedSenders !== undefined) { data[i][col['assignedSenders']] = params.assignedSenders; }
+    const today = formatDate(new Date());
 
-      // Update step-specific copy if provided
-      if (params.steps) {
-        const stepData = params.steps.find(function(s) { return s.sequenceStep === step; });
-        if (stepData) {
-          if (stepData.subjectLine !== undefined) { data[i][col['subjectLine']] = stepData.subjectLine; }
-          if (stepData.emailBody   !== undefined) { data[i][col['emailBody']]   = stepData.emailBody; }
-          if (stepData.awaitDays   !== undefined) { data[i][col['awaitDays']]   = stepData.awaitDays; }
+    // ── Decide the final step count ──────────────────────────────────────
+    // TWO DIFFERENT CONTRACTS, deliberately:
+    //
+    //   params.steps    — MERGE. Edits the steps you name, matched by
+    //                     sequenceStep. Never changes how many steps exist.
+    //                     Sending one step edits that step and nothing else.
+    //
+    //   params.setSteps — REPLACE. The array is the complete desired
+    //                     sequence: extra entries add rows, missing ones
+    //                     DELETE rows. Only send this when the user has
+    //                     explicitly asked to add or remove a step.
+    //
+    // Keeping these separate matters: an editor that saves one step at a
+    // time would silently destroy the rest of the sequence under a single
+    // authoritative contract.
+    let finalRows;
+
+    if (Array.isArray(params.setSteps) && params.setSteps.length > 0) {
+      const wanted = params.setSteps.slice().sort(function(a, b) {
+        return (a.sequenceStep || 0) - (b.sequenceStep || 0);
+      });
+
+      finalRows = wanted.map(function(stepData, idx) {
+        // Reuse the existing row for this step so its copy is preserved
+        // when the caller sends only some fields.
+        const existing = mine[idx];
+        const row = existing
+          ? existing.slice()
+          : (mine[0] ? mine[0].slice() : new Array(headers.length).fill(''));
+
+        const set = function(name, value) {
+          if (name in col) { row[col[name]] = value; }
+        };
+
+        set('sequenceStep', idx + 1);
+        if (!existing) {
+          // Brand new step — start empty rather than cloning step 1's copy.
+          set('subjectLine', '');
+          set('emailBody',   '');
+          set('awaitDays',   3);
+          set('createdDate', today);
         }
-      }
+        if (stepData.subjectLine !== undefined) { set('subjectLine', stepData.subjectLine); }
+        if (stepData.emailBody   !== undefined) { set('emailBody',   stepData.emailBody); }
+        if (stepData.awaitDays   !== undefined) { set('awaitDays',   parseInt(stepData.awaitDays, 10) || 0); }
 
-      data[i][col['lastModified']] = formatDate(new Date());
-      updatedCount++;
+        return row;
+      });
+
+    } else {
+      // Merge path: keep every existing row, edit only the ones named in
+      // params.steps. A step the caller did not mention is left untouched.
+      finalRows = mine.map(function(r) { return r.slice(); });
+
+      if (Array.isArray(params.steps)) {
+        finalRows.forEach(function(row) {
+          const rowStep = parseInt(row[col['sequenceStep']] || 1, 10);
+          const stepData = params.steps.find(function(s) {
+            return parseInt(s.sequenceStep, 10) === rowStep;
+          });
+          if (!stepData) { return; }
+
+          const set = function(name, value) {
+            if (name in col) { row[col[name]] = value; }
+          };
+          if (stepData.subjectLine !== undefined) { set('subjectLine', stepData.subjectLine); }
+          if (stepData.emailBody   !== undefined) { set('emailBody',   stepData.emailBody); }
+          if (stepData.awaitDays   !== undefined) { set('awaitDays',   parseInt(stepData.awaitDays, 10) || 0); }
+        });
+      }
     }
 
-    if (updatedCount > 0) {
-      sheet.getRange(2, 1, data.length, headers.length).setValues(data);
-      SpreadsheetApp.flush();
+    // ── Apply campaign-level fields to every row ─────────────────────────
+    const totalSteps = finalRows.length;
 
-      // If status changed cascade to masterLeads
-      if (params.campaignStatus !== undefined) {
-        cascadeCampaignStatus(campaignId, params.campaignStatus);
-      }
+    finalRows.forEach(function(row) {
+      const set = function(name, value) {
+        if (name in col) { row[col[name]] = value; }
+      };
+      if (params.campaignName          !== undefined) { set('campaignName',          params.campaignName); }
+      if (params.campaignStatus        !== undefined) { set('campaignStatus',        params.campaignStatus); }
+      if (params.windowStart           !== undefined) { set('windowStart',           params.windowStart); }
+      if (params.windowEnd             !== undefined) { set('windowEnd',             params.windowEnd); }
+      if (params.sendingDays           !== undefined) { set('sendingDays',           params.sendingDays); }
+      if (params.timezone              !== undefined) { set('timezone',              params.timezone); }
+      if (params.assignedSenders       !== undefined) { set('assignedSenders',       params.assignedSenders); }
+      if (params.notes                 !== undefined) { set('notes',                 params.notes); }
+      if (params.coldPriorityLimit     !== undefined) { set('coldPriorityLimit',     params.coldPriorityLimit); }
+      if (params.followupPriorityLimit !== undefined) { set('followupPriorityLimit', params.followupPriorityLimit); }
+      set('totalSequenceSteps', totalSteps);
+      set('lastModified', today);
+    });
+
+    // ── Rewrite the sheet ────────────────────────────────────────────────
+    const out = others.concat(finalRows);
+    sheet.getRange(2, 1, lastRow - 1, headers.length).clearContent();
+    if (out.length > 0) {
+      sheet.getRange(2, 1, out.length, headers.length).setValues(out);
+    }
+    SpreadsheetApp.flush();
+
+    // ── Keep existing leads in step with the campaign ────────────────────
+    // Without this, leads keep the old totalSequenceSteps and either stop
+    // early or chase a step that no longer exists.
+    let leadsUpdated = 0;
+    if (mine.length !== totalSteps) {
+      leadsUpdated = syncLeadTotalSteps_(campaignId, totalSteps);
     }
 
-    log('handleUpdateCampaign: updated ' + updatedCount + ' rows for ' + campaignId, 'INFO');
-    return { success: true, updated: updatedCount };
+    if (params.campaignStatus !== undefined) {
+      cascadeCampaignStatus(campaignId, params.campaignStatus);
+    }
 
-  } catch(e) {
+    log('handleUpdateCampaign: ' + campaignId + ' now has ' + totalSteps +
+        ' step(s), ' + leadsUpdated + ' lead(s) resynced', 'INFO');
+
+    return {
+      success: true,
+      campaignId: campaignId,
+      updated: finalRows.length,
+      totalSequenceSteps: totalSteps,
+      stepsAdded:   Math.max(0, totalSteps - mine.length),
+      stepsRemoved: Math.max(0, mine.length - totalSteps),
+      leadsResynced: leadsUpdated
+    };
+
+  } catch (e) {
     log('handleUpdateCampaign: error — ' + e.message, 'ERROR');
     return { success: false, error: e.message };
+  } finally {
+    releaseLock();
+  }
+}
+
+/**
+ * Rewrites totalSequenceSteps on every lead in a campaign after its step
+ * count changes. Also releases leads that were marked Completed only because
+ * they had reached the old final step.
+ *
+ * @param {string} campaignId
+ * @param {number} totalSteps
+ * @returns {number} rows updated
+ */
+function syncLeadTotalSteps_(campaignId, totalSteps) {
+  try {
+    const settings = getSettings(MASTER_SHEET_ID);
+    const ss       = SpreadsheetApp.openById(settings.leadsSpreadsheetId);
+    const sheet    = ss.getSheetByName(LEADS_SHEET_NAME);
+    if (!sheet || sheet.getLastRow() < 2) { return 0; }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const data    = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    const col     = {};
+    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+
+    if (!('totalSequenceSteps' in col)) { return 0; }
+
+    let changed = 0;
+    for (let i = 0; i < data.length; i++) {
+      if (String(data[i][col['campaignId']] || '').trim() !== campaignId) { continue; }
+
+      data[i][col['totalSequenceSteps']] = totalSteps;
+      changed++;
+
+      // A lead parked at the old last step should resume when steps are added.
+      if ('sequenceStatus' in col) {
+        const step = parseInt(data[i][col['sequenceStep']] || 0, 10);
+        const done = String(data[i][col['sequenceStatus']] || '').trim();
+        if (done === 'Completed' && step < totalSteps) {
+          data[i][col['sequenceStatus']] = '';
+        }
+      }
+    }
+
+    if (changed > 0) {
+      sheet.getRange(2, 1, data.length, headers.length).setValues(data);
+      SpreadsheetApp.flush();
+    }
+    return changed;
+
+  } catch (e) {
+    log('syncLeadTotalSteps_: error — ' + e.message, 'ERROR');
+    return 0;
+  }
+}
+
+/**
+ * Rewrites totalSequenceSteps on every lead in a campaign after its step
+ * count changes. Also releases leads that were marked Completed only because
+ * they had reached the old final step.
+ *
+ * @param {string} campaignId
+ * @param {number} totalSteps
+ * @returns {number} rows updated
+ */
+function syncLeadTotalSteps_(campaignId, totalSteps) {
+  try {
+    const settings = getSettings(MASTER_SHEET_ID);
+    const ss       = SpreadsheetApp.openById(settings.leadsSpreadsheetId);
+    const sheet    = ss.getSheetByName(LEADS_SHEET_NAME);
+    if (!sheet || sheet.getLastRow() < 2) { return 0; }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const data    = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
+    const col     = {};
+    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+
+    if (!('totalSequenceSteps' in col)) { return 0; }
+
+    let changed = 0;
+    for (let i = 0; i < data.length; i++) {
+      if (String(data[i][col['campaignId']] || '').trim() !== campaignId) { continue; }
+
+      data[i][col['totalSequenceSteps']] = totalSteps;
+      changed++;
+
+      // A lead parked at the old last step should resume when steps are added.
+      if ('sequenceStatus' in col) {
+        const step = parseInt(data[i][col['sequenceStep']] || 0, 10);
+        const done = String(data[i][col['sequenceStatus']] || '').trim();
+        if (done === 'Completed' && step < totalSteps) {
+          data[i][col['sequenceStatus']] = '';
+        }
+      }
+    }
+
+    if (changed > 0) {
+      sheet.getRange(2, 1, data.length, headers.length).setValues(data);
+      SpreadsheetApp.flush();
+    }
+    return changed;
+
+  } catch (e) {
+    log('syncLeadTotalSteps_: error — ' + e.message, 'ERROR');
+    return 0;
   }
 }
 
@@ -2575,6 +2833,7 @@ function handleGetLeads(params) {
   const page       = parseInt(params.page     || 1,    10);
   const pageSize   = parseInt(params.pageSize || 50,   10);
   const statusFilter = String(params.status   || '').trim();
+  const search = String(params.search || '').trim().toLowerCase();
 
   try {
     const settings     = getSettings(MASTER_SHEET_ID);
@@ -2595,6 +2854,15 @@ function handleGetLeads(params) {
       const rowStatus   = String(row[col['status']]     || '').trim();
       if (campaignId && rowCampaign !== campaignId) { return false; }
       if (statusFilter && rowStatus !== statusFilter)  { return false; }
+
+      if (search) {
+        // Match the fields a person would actually search by.
+        const haystack = [
+          row[col['email']], row[col['firstName']], row[col['lastName']],
+          row[col['companyName']], row[col['leadId']]
+        ].map(function(v) { return String(v || '').toLowerCase(); }).join(' ');
+        if (haystack.indexOf(search) === -1) { return false; }
+      }
       return true;
     });
 
@@ -2602,27 +2870,51 @@ function handleGetLeads(params) {
     const start  = (page - 1) * pageSize;
     const paged  = filtered.slice(start, start + pageSize);
 
-    const leads = paged.map(function(row) {
+        const leads = paged.map(function(row) {
+      // Every column, read only when present, so this is safe whatever shape
+      // the sheet is in.
+      const get = function(name) {
+        return (name in col) ? String(row[col[name]] || '').trim() : '';
+      };
+
       return {
-        leadId:         String(row[col['leadId']]         || '').trim(),
-        email:          String(row[col['email']]          || '').trim(),
-        firstName:      String(row[col['firstName']]      || '').trim(),
-        lastName:       String(row[col['lastName']]       || '').trim(),
-        companyName:    String(row[col['companyName']]    || '').trim(),
-        jobTitle:       String(row[col['jobTitle']]       || '').trim(),
-        campaignId:     String(row[col['campaignId']]     || '').trim(),
-        status:         String(row[col['status']]         || '').trim(),
-        sequenceStep:   parseInt(row[col['sequenceStep']] || 0, 10),
-        replyStatus:    String(row[col['replyStatus']]    || '').trim(),
-        bounceStatus:   String(row[col['bounceStatus']]   || '').trim(),
-        lastSentDate:   String(row[col['lastSentDate']]   || '').trim(),
-        nextSentDate:   String(row[col['nextSentDate']]   || '').trim(),
-        ownerSender:    String(row[col['ownerSender']]    || '').trim()
+        leadId:             get('leadId'),
+        email:              get('email'),
+        firstName:          get('firstName'),
+        lastName:           get('lastName'),
+        companyName:        get('companyName'),
+        companyWebsite:     get('companyWebsite'),
+        jobTitle:           get('jobTitle'),
+        department:         get('department'),
+        industry:           get('industry'),
+        addressLine:        get('addressLine'),
+        city:               get('city'),
+        state:              get('state'),
+        country:            get('country'),
+        countryCode:        get('countryCode'),
+        phoneNumber:        get('phoneNumber'),
+        linkedinPersonUrl:  get('linkedinPersonUrl'),
+        linkedinCompanyUrl: get('linkedinCompanyUrl'),
+        customVar1:         get('customVar1'),
+        customVar2:         get('customVar2'),
+        customVar3:         get('customVar3'),
+        customVar4:         get('customVar4'),
+        customVar5:         get('customVar5'),
+        campaignId:         get('campaignId'),
+        status:             get('status'),
+        sequenceStep:       parseInt(row[col['sequenceStep']] || 0, 10),
+        sequenceStatus:     get('sequenceStatus'),
+        replyStatus:        get('replyStatus'),
+        bounceStatus:       get('bounceStatus'),
+        lastSentDate:       get('lastSentDate'),
+        nextSentDate:       get('nextSentDate'),
+        ownerSender:        get('ownerSender')
       };
     });
 
     return {
       success:  true,
+      searched: !!search,
       leads:    leads,
       total:    total,
       page:     page,
@@ -2758,6 +3050,14 @@ function handleArchiveCampaignLeads(params) {
     archiveSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
     archiveSheet.getRange(2, 1, toArchive.length, headers.length).setValues(toArchive);
     SpreadsheetApp.flush();
+    // ── metrics sheet ─────────────────────────────────────────────────────
+    // Computed from the rows being archived, so it stays true even after the
+    // leads leave masterLeads and the campaign row is deleted.
+    try {
+      writeArchiveMetrics_(archiveSS, campaignId, toArchive, col);
+    } catch (e) {
+      log('handleArchiveCampaignLeads: metrics sheet failed — ' + e.message, 'WARN');
+    }
 
     // ── Set sharing to anyone with link can edit ─────────────────────────
     const archiveFile = DriveApp.getFileById(archiveSS.getId());
@@ -2775,7 +3075,7 @@ function handleArchiveCampaignLeads(params) {
         'Campaign ' + campaignId + ' leads have been archived.\n\n' +
         'Total archived: ' + toArchive.length + ' leads\n' +
         'Archive spreadsheet: ' + archiveUrl + '\n\n' +
-        'This archive was created by X Reacher.'
+        'This archive was created by Reach X.'
       );
       log('handleArchiveCampaignLeads: notification sent to ' + alertsEmail, 'INFO');
     } else {
@@ -2793,6 +3093,14 @@ function handleArchiveCampaignLeads(params) {
         ' kept=' + toKeep.length +
         ' url=' + archiveUrl, 'INFO');
 
+    // Reflect the archive immediately rather than waiting for the nightly sync.
+    try {
+      const settings = getSettings(MASTER_SHEET_ID);
+      syncCampaignStats(MASTER_SHEET_ID, settings.leadsSpreadsheetId);
+    } catch (e) {
+      log('handleArchiveCampaignLeads: stats resync failed — ' + e.message, 'WARN');
+    }
+
     return {
       success:    true,
       archived:   toArchive.length,
@@ -2800,6 +3108,7 @@ function handleArchiveCampaignLeads(params) {
       archiveUrl: archiveUrl,
       archiveName: archiveName
     };
+    
 
   } catch(e) {
     log('handleArchiveCampaignLeads: error — ' + e.message, 'ERROR');
@@ -2990,7 +3299,10 @@ function handleGetSenders(params) {
         totalLeadsContacted: parseInt(row[col['totalLeadsContacted']] || 0, 10),
         repliesReceived:parseInt(row[col['repliesReceived']]||0, 10),
         bouncedEmails:  parseInt(row[col['bouncedEmails']] || 0, 10),
-        lastRunTime:    String(row[col['lastRunTime']]    || '').trim()
+        lastRunTime:    String(row[col['lastRunTime']]    || '').trim(),
+        notes:          String(row[col['notes']]          || '').trim(),
+        tagName:        String(row[col['tagName']]        || '').trim(),
+        tagColor:       String(row[col['tagColor']]       || '').trim()
       };
     }).filter(function(s) { return !!s.emailID; });
 
@@ -3064,6 +3376,18 @@ function handleGetCampaignStats(params) {
       else if (status === 'queued')       { stats.queued++;    }
       else if (status === 'sent')         { stats.sent++;      }
       else if (status === 'error')        { stats.error++;     }
+    }
+    // Recount from the rows just walked, so the Overview tab does not depend
+    // on when the sync last ran.
+    stats.stepsSent      = 0;
+    stats.contactedCount = 0;
+    for (let i = 0; i < data.length; i++) {
+      if (String(data[i][col['campaignId']] || '').trim() !== campaignId) { continue; }
+      const step = parseInt(data[i][col['sequenceStep']] || 0, 10);
+      if (step > 0) {
+        stats.stepsSent += step;
+        stats.contactedCount++;
+      }
     }
 
     // Calculate rates
@@ -3288,9 +3612,146 @@ function handleGetSendersByTag(params) {
   }
 }
 
+/** Splits a comma list into trimmed members. */
+function splitList_(value) {
+  return String(value || '').split(',')
+    .map(function(x) { return x.trim(); })
+    .filter(function(x) { return x !== ''; });
+}
+
 /**
- * Get all unique tags with sender counts
+ * Reads a row's tags as [{ name, color }], tolerating a colour list that is
+ * shorter than the tag list (rows written before this patch have exactly one).
  */
+function readRowTags_(tagsRaw, colorsRaw) {
+  const names  = splitList_(tagsRaw);
+  const colors = splitList_(colorsRaw);
+  return names.map(function(name, i) {
+    return { name: name, color: colors[i] || '' };
+  });
+}
+
+function handleAssignTag(params) {
+  // No default of 'all' — tagging every sender in the system must be asked
+  // for explicitly, never fallen into by omitting a field.
+  const senderIds = params.senderIds;
+  const tagName   = String(params.tagName  || '').trim();
+  const tagColor  = String(params.tagColor || '#6b7280').trim();
+
+  if (!tagName)   { return { success: false, error: 'Missing tagName' }; }
+  if (!senderIds) { return { success: false, error: 'Missing senderIds — pass an array, or the string "all"' }; }
+
+  if (!acquireLock(30)) {
+    return { success: false, error: 'Busy — could not acquire lock' };
+  }
+
+  try {
+    const ss      = SpreadsheetApp.openById(MASTER_SHEET_ID);
+    const sheet   = ss.getSheetByName(SHEET_SENDER_ACCOUNTS);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) { return { success: false, error: 'No senders found' }; }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const data    = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    const col     = {};
+    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+
+    if (!('tagName' in col) || !('tagColor' in col)) {
+      return { success: false, error: 'tagName or tagColor column not found in senderAccounts' };
+    }
+
+    const targetAll = (senderIds === 'all');
+    const targetIds = targetAll ? [] : (Array.isArray(senderIds) ? senderIds : [senderIds]);
+
+    let updated = 0;
+    for (let i = 0; i < data.length; i++) {
+      const rowEmailID = String(data[i][col['emailID']] || '').trim();
+      if (!targetAll && targetIds.indexOf(rowEmailID) === -1) { continue; }
+
+      const tags = readRowTags_(data[i][col['tagName']], data[i][col['tagColor']]);
+      const hit  = tags.filter(function(t) { return t.name === tagName; })[0];
+
+      if (hit) { hit.color = tagColor; }        // re-colouring an existing tag
+      else     { tags.push({ name: tagName, color: tagColor }); }
+
+      data[i][col['tagName']]  = tags.map(function(t) { return t.name; }).join(',');
+      data[i][col['tagColor']] = tags.map(function(t) { return t.color || '#6b7280'; }).join(',');
+      updated++;
+    }
+
+    if (updated > 0) {
+      sheet.getRange(2, 1, data.length, headers.length).setValues(data);
+      SpreadsheetApp.flush();
+    }
+
+    log('handleAssignTag: ' + tagName + ' → ' + updated + ' sender(s)', 'INFO');
+    return { success: true, tag: tagName, color: tagColor, updated: updated };
+
+  } catch (e) {
+    log('handleAssignTag: error — ' + e.message, 'ERROR');
+    return { success: false, error: e.message };
+  } finally {
+    releaseLock();
+  }
+}
+
+function handleRemoveTag(params) {
+  const senderIds = params.senderIds;
+  const tagName   = String(params.tagName || '').trim();
+
+  if (!tagName)   { return { success: false, error: 'Missing tagName' }; }
+  if (!senderIds) { return { success: false, error: 'Missing senderIds — pass an array, or the string "all"' }; }
+
+  if (!acquireLock(30)) {
+    return { success: false, error: 'Busy — could not acquire lock' };
+  }
+
+  try {
+    const ss      = SpreadsheetApp.openById(MASTER_SHEET_ID);
+    const sheet   = ss.getSheetByName(SHEET_SENDER_ACCOUNTS);
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) { return { success: true, updated: 0 }; }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const data    = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    const col     = {};
+    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+
+    const targetAll = (senderIds === 'all');
+    const targetIds = targetAll ? [] : (Array.isArray(senderIds) ? senderIds : [senderIds]);
+
+    let updated = 0;
+    for (let i = 0; i < data.length; i++) {
+      const rowEmailID = String(data[i][col['emailID']] || '').trim();
+      if (!targetAll && targetIds.indexOf(rowEmailID) === -1) { continue; }
+
+      const tags = readRowTags_(data[i][col['tagName']], data[i][col['tagColor']]);
+      // Compare against each member. The original compared the whole joined
+      // string, so "warm,uk" never matched "uk" and removal silently no-opped.
+      const kept = tags.filter(function(t) { return t.name !== tagName; });
+      if (kept.length === tags.length) { continue; }
+
+      data[i][col['tagName']]  = kept.map(function(t) { return t.name; }).join(',');
+      data[i][col['tagColor']] = kept.map(function(t) { return t.color || '#6b7280'; }).join(',');
+      updated++;
+    }
+
+    if (updated > 0) {
+      sheet.getRange(2, 1, data.length, headers.length).setValues(data);
+      SpreadsheetApp.flush();
+    }
+
+    log('handleRemoveTag: ' + tagName + ' removed from ' + updated + ' sender(s)', 'INFO');
+    return { success: true, tag: tagName, updated: updated };
+
+  } catch (e) {
+    log('handleRemoveTag: error — ' + e.message, 'ERROR');
+    return { success: false, error: e.message };
+  } finally {
+    releaseLock();
+  }
+}
+
 function handleGetAllTags(params) {
   try {
     const ss      = SpreadsheetApp.openById(MASTER_SHEET_ID);
@@ -3305,129 +3766,27 @@ function handleGetAllTags(params) {
 
     const tagMap = {};
     for (let i = 0; i < data.length; i++) {
-      const tagsRaw  = String(data[i][col['tagName']]  || '').trim();
-      const tagColor = String(data[i][col['tagColor']] || '').trim();
-      if (!tagsRaw) { continue; }
-
-      const tagList = tagsRaw.split(',').map(function(t) { return t.trim(); });
-      tagList.forEach(function(tagName) {
-        if (!tagName) { return; }
-        if (!tagMap[tagName]) {
-          tagMap[tagName] = { tagName: tagName, tagColor: tagColor, senderCount: 0 };
+      const tags = readRowTags_(data[i][col['tagName']], data[i][col['tagColor']]);
+      tags.forEach(function(t) {
+        if (!tagMap[t.name]) {
+          tagMap[t.name] = { tagName: t.name, tagColor: t.color || '', senderCount: 0 };
         }
-        tagMap[tagName].senderCount++;
+        // First non-empty colour wins, so one tag reads the same everywhere
+        // even if two rows disagree.
+        if (!tagMap[t.name].tagColor && t.color) { tagMap[t.name].tagColor = t.color; }
+        tagMap[t.name].senderCount++;
       });
     }
 
-    const tags = Object.values(tagMap);
+    const tags = Object.keys(tagMap).map(function(k) {
+      if (!tagMap[k].tagColor) { tagMap[k].tagColor = '#6b7280'; }
+      return tagMap[k];
+    }).sort(function(a, b) { return a.tagName.localeCompare(b.tagName); });
+
     return { success: true, tags: tags };
 
-  } catch(e) {
+  } catch (e) {
     log('handleGetAllTags: error — ' + e.message, 'ERROR');
-    return { success: false, error: e.message };
-  }
-}
-
-/**
- * Assign a tag to one or multiple senders
- */
-function handleAssignTag(params) {
-  const senderIds = params.senderIds || 'all';
-  const tagName   = String(params.tagName   || '').trim();
-  const tagColor  = String(params.tagColor  || '#6b7280').trim();
-
-  if (!tagName) { return { success: false, error: 'Missing tagName' }; }
-
-  try {
-    const ss      = SpreadsheetApp.openById(MASTER_SHEET_ID);
-    const sheet   = ss.getSheetByName(SHEET_SENDER_ACCOUNTS);
-    const lastRow = sheet.getLastRow();
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const data    = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
-    const col     = {};
-    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
-
-    if (!('tagName' in col) || !('tagColor' in col)) {
-      return { success: false, error: 'tagName or tagColor column not found in senderAccounts' };
-    }
-
-    const targetAll = senderIds === 'all';
-    const targetIds = targetAll ? [] : (Array.isArray(senderIds) ? senderIds : [senderIds]);
-
-    let updatedCount = 0;
-    for (let i = 0; i < data.length; i++) {
-      const rowEmailID = String(data[i][col['emailID']] || '').trim();
-      if (!targetAll && targetIds.indexOf(rowEmailID) === -1) { continue; }
-      // Get existing tags and add new one if not already there
-      const existingTags = String(data[i][col['tagName']] || '').trim();
-      const tagList      = existingTags ? existingTags.split(',').map(function(t) { return t.trim(); }) : [];
-      if (tagList.indexOf(tagName) === -1) { tagList.push(tagName); }
-      data[i][col['tagName']]  = tagList.join(',');
-      data[i][col['tagColor']] = tagColor; // color of last assigned tag
-      updatedCount++;
-    }
-
-    if (updatedCount > 0) {
-      sheet.getRange(2, 1, data.length, headers.length).setValues(data);
-      SpreadsheetApp.flush();
-    }
-
-    log('handleAssignTag: assigned tag=' + tagName + ' to ' + updatedCount + ' senders', 'INFO');
-    return { success: true, tag: tagName, updated: updatedCount };
-
-  } catch(e) {
-    log('handleAssignTag: error — ' + e.message, 'ERROR');
-    return { success: false, error: e.message };
-  }
-}
-
-/**
- * Remove tag from senders
- */
-function handleRemoveTag(params) {
-  const senderIds = params.senderIds || [];
-  const tagName   = String(params.tagName || '').trim();
-
-  try {
-    const ss      = SpreadsheetApp.openById(MASTER_SHEET_ID);
-    const sheet   = ss.getSheetByName(SHEET_SENDER_ACCOUNTS);
-    const lastRow = sheet.getLastRow();
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const data    = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
-    const col     = {};
-    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
-
-    const targetAll = senderIds === 'all';
-    const targetIds = targetAll ? [] : (Array.isArray(senderIds) ? senderIds : [senderIds]);
-
-    let updatedCount = 0;
-    for (let i = 0; i < data.length; i++) {
-      const rowEmailID = String(data[i][col['emailID']] || '').trim();
-      const rowTag     = String(data[i][col['tagName']] || '').trim();
-
-      // If tagName provided only remove if matches
-      if (tagName && rowTag !== tagName) { continue; }
-      if (!targetAll && targetIds.indexOf(rowEmailID) === -1) { continue; }
-
-      // Remove only the specific tag, keep others
-      const existingTags = String(data[i][col['tagName']] || '').trim();
-      const tagList      = existingTags ? existingTags.split(',').map(function(t) { return t.trim(); }) : [];
-      const newTagList   = tagList.filter(function(t) { return t !== tagName; });
-      data[i][col['tagName']]  = newTagList.join(',');
-      if (newTagList.length === 0) { data[i][col['tagColor']] = ''; }
-      updatedCount++;
-    }
-
-    if (updatedCount > 0) {
-      sheet.getRange(2, 1, data.length, headers.length).setValues(data);
-      SpreadsheetApp.flush();
-    }
-
-    log('handleRemoveTag: removed tag from ' + updatedCount + ' senders', 'INFO');
-    return { success: true, updated: updatedCount };
-
-  } catch(e) {
-    log('handleRemoveTag: error — ' + e.message, 'ERROR');
     return { success: false, error: e.message };
   }
 }
@@ -4003,6 +4362,303 @@ function handleSendDailyDigest(params) {
     sendDailyDigest();
     return { success: true, message: 'Daily digest sent' };
   } catch(e) {
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Writes a permanent performance snapshot into an archive spreadsheet.
+ *
+ * Counted the same way getCampaignStats does — bounced, then replied, then
+ * completed, then status — so the archive agrees with what the app showed
+ * while the campaign was live.
+ *
+ * @param {Spreadsheet} archiveSS  the newly created archive
+ * @param {string}      campaignId
+ * @param {Array}       rows       the lead rows being archived
+ * @param {Object}      col        header name → index, from masterLeads
+ */
+function writeArchiveMetrics_(archiveSS, campaignId, rows, col) {
+  const s = {
+    total: 0, pending: 0, queued: 0, sent: 0,
+    replied: 0, bounced: 0, completed: 0, error: 0
+  };
+  const senders = {};
+  let firstSent = '', lastSent = '';
+
+  for (let i = 0; i < rows.length; i++) {
+    const status    = String(rows[i][col['status']]         || '').trim().toLowerCase();
+    const reply     = String(rows[i][col['replyStatus']]    || '').trim().toLowerCase();
+    const bounce    = String(rows[i][col['bounceStatus']]   || '').trim().toLowerCase();
+    const seqStatus = String(rows[i][col['sequenceStatus']] || '').trim().toLowerCase();
+    const owner     = String(rows[i][col['ownerSender']]    || '').trim();
+    const sentDate  = String(rows[i][col['lastSentDate']]   || '').trim();
+
+    s.total++;
+    if (owner) { senders[owner] = (senders[owner] || 0) + 1; }
+
+    if (sentDate) {
+      if (!firstSent || sentDate < firstSent) { firstSent = sentDate; }
+      if (!lastSent  || sentDate > lastSent)  { lastSent  = sentDate; }
+    }
+
+    if      (bounce    === 'bounced')   { s.bounced++; }
+    else if (reply     === 'replied')   { s.replied++; }
+    else if (seqStatus === 'completed') { s.completed++; }
+    else if (status === 'pending')      { s.pending++; }
+    else if (status === 'queued')       { s.queued++; }
+    else if (status === 'sent')         { s.sent++; }
+    else if (status === 'error')        { s.error++; }
+  }
+
+  // Anyone who received at least one email. Rates against total leads would
+  // count people who were never contacted and read far too low.
+  const contacted = s.sent + s.replied + s.completed + s.bounced;
+  const rate = function(part) {
+    return contacted > 0 ? ((part / contacted) * 100).toFixed(2) + '%' : '0%';
+  };
+
+  const sheet = archiveSS.insertSheet('metrics');
+  const out = [
+    ['Metric', 'Value'],
+    ['Campaign ID',        campaignId],
+    ['Archived on',        formatDate(new Date())],
+    ['First send',         firstSent || 'never sent'],
+    ['Last send',          lastSent  || 'never sent'],
+    ['', ''],
+    ['Total leads',        s.total],
+    ['Contacted',          contacted],
+    ['Never contacted',    s.pending + s.queued],
+    ['', ''],
+    ['Replied',            s.replied],
+    ['Reply rate',         rate(s.replied)],
+    ['Bounced',            s.bounced],
+    ['Bounce rate',        rate(s.bounced)],
+    ['', ''],
+    ['Completed sequence', s.completed],
+    ['Awaiting reply',     s.sent],
+    ['Pending',            s.pending],
+    ['Queued',             s.queued],
+    ['Errors',             s.error],
+    ['', ''],
+    ['Senders used',       Object.keys(senders).length]
+  ];
+
+  Object.keys(senders).sort().forEach(function(id) {
+    out.push(['   ' + id, senders[id]]);
+  });
+
+  sheet.getRange(1, 1, out.length, 2).setValues(out);
+
+  const header = sheet.getRange(1, 1, 1, 2);
+  header.setBackground('#0f1117').setFontColor('#ffffff').setFontWeight('bold');
+  sheet.setFrozenRows(1);
+  sheet.setColumnWidth(1, 200);
+  sheet.setColumnWidth(2, 160);
+  sheet.getRange(1, 1, out.length, 1).setFontWeight('bold');
+
+  SpreadsheetApp.flush();
+}
+/**
+ * Recomputes every campaign's counters from masterLeads, on demand.
+ *
+ * Same work the nightly runSyncStats trigger does. Exposed as an action so the
+ * app does not have to wait until 11:30 PM to show what was sent today.
+ */
+function handleSyncStats(params) {
+  try {
+    const settings = getSettings(MASTER_SHEET_ID);
+    if (!settings.leadsSpreadsheetId) {
+      return { success: false, error: 'leadsSpreadsheetId is not set in Settings' };
+    }
+
+    syncCampaignStats(MASTER_SHEET_ID, settings.leadsSpreadsheetId);
+
+    log('handleSyncStats: campaign counters resynced on demand', 'INFO');
+    return { success: true, message: 'Campaign counters are up to date.' };
+
+  } catch (e) {
+    log('handleSyncStats: error — ' + e.message, 'ERROR');
+    return { success: false, error: e.message };
+  }
+}
+/**
+ * Finds senders that have work queued but no chain running, and optionally
+ * restarts them.
+ *
+ * A sender is "stalled" when its inbox holds Queued rows while no
+ * processSingleSend / processSingleFollowup trigger exists. That combination
+ * means the chain died and nothing will restart it on its own.
+ *
+ * @param {Object} params
+ *   params.autoFix    - restart what is found. Default true.
+ *   params.senderIds  - optional array to check only those senders.
+ * @returns {{ success, checked, healthy, stalled, unreachable, restarted, senders }}
+ */
+function handleCheckSenderChains(params) {
+  const autoFix = params.autoFix !== false;
+  const only    = Array.isArray(params.senderIds) ? params.senderIds : null;
+
+  try {
+    let senders = getActiveSenders().filter(function(s) { return !!s.webAppUrl; });
+    if (only) {
+      senders = senders.filter(function(s) { return only.indexOf(s.emailID) !== -1; });
+    }
+    if (senders.length === 0) {
+      return { success: true, checked: 0, healthy: 0, stalled: 0,
+               unreachable: 0, restarted: 0, senders: [] };
+    }
+
+    const report = [];
+    let healthy = 0, stalled = 0, unreachable = 0, restarted = 0;
+
+    for (let b = 0; b < senders.length; b += 50) {
+      const batch = senders.slice(b, b + 50);
+
+      let responses = [];
+      try {
+        responses = UrlFetchApp.fetchAll(batch.map(function(s) {
+          return {
+            url: s.webAppUrl, method: 'post', contentType: 'application/json',
+            payload: JSON.stringify({ action: 'getSenderStatus' }),
+            muteHttpExceptions: true
+          };
+        }));
+      } catch (e) {
+        batch.forEach(function(s) {
+          unreachable++;
+          report.push({ emailID: s.emailID, state: 'unreachable', error: e.message });
+        });
+        continue;
+      }
+
+      // Collect the restarts for this batch and fire them together.
+      const toRestart = [];
+
+      for (let r = 0; r < responses.length; r++) {
+        const s = batch[r];
+
+        if (responses[r].getResponseCode() !== 200) {
+          unreachable++;
+          report.push({ emailID: s.emailID, state: 'unreachable',
+                        error: 'HTTP ' + responses[r].getResponseCode() });
+          continue;
+        }
+
+        let st;
+        try {
+          st = JSON.parse(responses[r].getContentText());
+        } catch (e) {
+          unreachable++;
+          report.push({ emailID: s.emailID, state: 'unreadable', error: e.message });
+          continue;
+        }
+
+        const names       = st.triggerNames || [];
+        const coldQueued  = st.coldQueued     || 0;
+        const followQueued= st.followupQueued || 0;
+        const coldRunning = names.indexOf('processSingleSend') !== -1;
+        const followRunning = names.indexOf('processSingleFollowup') !== -1;
+        const atLimit     = (st.sentToday || 0) >= (st.dailyLimit || 25);
+
+        const coldStalled   = coldQueued   > 0 && !coldRunning   && !atLimit;
+        const followStalled = followQueued > 0 && !followRunning && !atLimit;
+
+        if (!coldStalled && !followStalled) {
+          healthy++;
+          report.push({
+            emailID: s.emailID, state: atLimit ? 'at daily limit' : 'ok',
+            coldQueued: coldQueued, followupQueued: followQueued,
+            sentToday: st.sentToday || 0, dailyLimit: st.dailyLimit || 0
+          });
+          continue;
+        }
+
+        stalled++;
+        report.push({
+          emailID: s.emailID, state: 'stalled',
+          coldQueued: coldQueued, followupQueued: followQueued,
+          coldStalled: coldStalled, followupStalled: followStalled,
+          sentToday: st.sentToday || 0, dailyLimit: st.dailyLimit || 0
+        });
+
+        if (autoFix) {
+          if (coldStalled)   { toRestart.push({ url: s.webAppUrl, act: 'kickoffCold' }); }
+          if (followStalled) { toRestart.push({ url: s.webAppUrl, act: 'kickoffFollowup' }); }
+        }
+      }
+
+      if (toRestart.length > 0) {
+        try {
+          UrlFetchApp.fetchAll(toRestart.map(function(t) {
+            return {
+              url: t.url, method: 'post', contentType: 'application/json',
+              payload: JSON.stringify({ action: t.act }),
+              muteHttpExceptions: true
+            };
+          }));
+          restarted += toRestart.length;
+        } catch (e) {
+          log('handleCheckSenderChains: restart batch failed — ' + e.message, 'WARN');
+        }
+      }
+    }
+
+    log('handleCheckSenderChains: checked=' + senders.length +
+        ' healthy=' + healthy + ' stalled=' + stalled +
+        ' unreachable=' + unreachable + ' restarted=' + restarted, 'INFO');
+
+    return {
+      success: true,
+      checked: senders.length,
+      healthy: healthy, stalled: stalled,
+      unreachable: unreachable, restarted: restarted,
+      autoFixed: autoFix,
+      senders: report
+    };
+
+  } catch (e) {
+    log('handleCheckSenderChains: error — ' + e.message, 'ERROR');
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Restarts one sender's chains, whether or not it looks stalled.
+ * Backs the per-row restart button on the Email Accounts page.
+ */
+function handleRestartSenderChain(params) {
+  const emailID = String(params.emailID || '').trim();
+  if (!emailID) { return { success: false, error: 'Missing emailID' }; }
+
+  try {
+    const sender = getActiveSenders().filter(function(s) {
+      return s.emailID === emailID;
+    })[0];
+
+    if (!sender)            { return { success: false, error: 'Sender not found or not active: ' + emailID }; }
+    if (!sender.webAppUrl)  { return { success: false, error: 'Sender has no webAppUrl: ' + emailID }; }
+
+    const results = ['kickoffCold', 'kickoffFollowup'].map(function(act) {
+      try {
+        const res = UrlFetchApp.fetch(sender.webAppUrl, {
+          method: 'post', contentType: 'application/json',
+          payload: JSON.stringify({ action: act }),
+          muteHttpExceptions: true
+        });
+        return { action: act, ok: res.getResponseCode() === 200 };
+      } catch (e) {
+        return { action: act, ok: false, error: e.message };
+      }
+    });
+
+    const ok = results.every(function(r) { return r.ok; });
+    log('handleRestartSenderChain: ' + emailID + ' — ' + (ok ? 'restarted' : 'partial'), 'INFO');
+
+    return { success: true, emailID: emailID, restarted: ok, results: results };
+
+  } catch (e) {
+    log('handleRestartSenderChain: error — ' + e.message, 'ERROR');
     return { success: false, error: e.message };
   }
 }
