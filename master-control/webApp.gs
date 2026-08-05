@@ -391,11 +391,10 @@ function handleUpdateColdSent(params) {
     return { success: false, error: 'No updates provided' };
   }
 
-  // MUST hold the lock: getLastRow() + setValues() is a read-modify-write, and at
-  // 200-300 senders several senders POST here at the same time. Without the lock
-  // two executions compute the same startRow and one silently overwrites the
-  // other, and processStagingUpdates() can clear rows appended after it read.
-  // A false here makes the sender cache the batch and retry (savePendingUpdates_).
+  // MUST hold the lock: getLastRow() + setValues() is a read-modify-write, and
+  // several senders POST here at the same time. Without the lock two executions
+  // compute the same startRow and one silently overwrites the other.
+  // Returning false makes the sender cache the batch and retry.
   if (!acquireLock(30)) {
     log('handleUpdateColdSent: could not acquire lock — sender will retry', 'WARN');
     return { success: false, error: 'Busy — could not acquire lock' };
@@ -461,7 +460,7 @@ function handleUpdateFollowupSent(params) {
     return { success: false, error: 'No updates provided' };
   }
 
-  // Same concurrent read-modify-write hazard as handleUpdateColdSent — see note there.
+  // Same concurrent read-modify-write hazard as handleUpdateColdSent.
   if (!acquireLock(30)) {
     log('handleUpdateFollowupSent: could not acquire lock — sender will retry', 'WARN');
     return { success: false, error: 'Busy — could not acquire lock' };
@@ -973,6 +972,8 @@ function incrementSenderCounters(coldCount, followupCount, senderId) {
       if ('sentToday'          in col) { data[i][col['sentToday']]          = (parseInt(data[i][col['sentToday']]          || 0, 10)) + coldCount + followupCount; }
       if ('totalSentCount'     in col) { data[i][col['totalSentCount']]     = (parseInt(data[i][col['totalSentCount']]     || 0, 10)) + coldCount + followupCount; }
       if ('totalLeadsContacted' in col && coldCount > 0) { data[i][col['totalLeadsContacted']] = (parseInt(data[i][col['totalLeadsContacted']] || 0, 10)) + coldCount; }
+      if ('initialSentToday'   in col && coldCount     > 0) { data[i][col['initialSentToday']]   = (parseInt(data[i][col['initialSentToday']]   || 0, 10)) + coldCount; }
+      if ('followupSentToday'  in col && followupCount > 0) { data[i][col['followupSentToday']]  = (parseInt(data[i][col['followupSentToday']]  || 0, 10)) + followupCount; }
       if ('lastRunTime'        in col) { data[i][col['lastRunTime']]        = new Date().toISOString(); }
       matchedIndex = i;
       break;
@@ -1585,6 +1586,7 @@ function processStagingUpdates() {
 
     const headers  = stagingSheet.getRange(1, 1, 1, stagingSheet.getLastColumn()).getValues()[0];
     const data     = stagingSheet.getRange(2, 1, stagingSheet.getLastRow() - 1, stagingSheet.getLastColumn()).getValues();
+    const rowsRead = data.length;   // exactly what gets deleted at the end
     const col      = {};
     headers.forEach(function(h, i) { col[String(h).trim()] = i; });
 
@@ -1608,10 +1610,12 @@ function processStagingUpdates() {
 
     // Apply ALL staging rows to masterLeads in memory
     let updateCount = 0;
+    const unmatched = [];
     for (let i = 0; i < data.length; i++) {
       const action   = String(data[i][col['action']]   || '').trim();
       const leadId   = String(data[i][col['leadId']]   || '').trim();
-      if (!leadId || !(leadId in leadIdMap))            { continue; }
+      if (!leadId)                { continue; }
+      if (!(leadId in leadIdMap)) { unmatched.push(leadId); continue; }
 
       const idx = leadIdMap[leadId];
 
@@ -1641,11 +1645,25 @@ function processStagingUpdates() {
       log('processStagingUpdates: wrote ' + updateCount + ' updates to masterLeads', 'INFO');
     }
 
-    // Clear staging sheet — keep header only
-    if (stagingSheet.getLastRow() > 1) {
-      stagingSheet.getRange(2, 1, stagingSheet.getLastRow() - 1, stagingSheet.getLastColumn()).clearContent();
+    if (unmatched.length > 0) {
+      log('processStagingUpdates: ' + unmatched.length + ' staged update(s) had a leadId that is ' +
+          'not in masterLeads and were discarded: ' + unmatched.slice(0, 20).join(', '), 'ERROR');
+    }
+
+    // Remove ONLY the rows just processed.
+    //
+    // This used to re-read getLastRow() and clear everything present at that
+    // moment. Reading the sheet, working through masterLeads and then clearing is
+    // not instant, and a sender finishing a send in that gap appended a row that
+    // was wiped without ever being applied — the email went out, the sender logged
+    // success, and the lead stayed Queued in masterLeads forever.
+    //
+    // deleteRows shifts any later arrivals up rather than leaving blank gaps, so
+    // the next run picks them up cleanly.
+    if (rowsRead > 0) {
+      stagingSheet.deleteRows(2, rowsRead);
       SpreadsheetApp.flush();
-      log('processStagingUpdates: cleared staging sheet', 'INFO');
+      log('processStagingUpdates: cleared ' + rowsRead + ' processed staging row(s)', 'INFO');
     }
 
   } catch (e) {
@@ -2943,22 +2961,40 @@ function handleUpdateSender(params) {
 
     let senderRow    = null;
     let senderWebApp = null;
+    const missingCols = [];
 
     for (let i = 0; i < data.length; i++) {
       const rowEmailID = String(data[i][col['emailID']] || '').trim();
       if (rowEmailID !== emailID) { continue; }
 
+      // Writing through col[name] when the column does not exist assigns to
+      // data[i][undefined] — a string key that setValues() never writes, so the
+      // save reports success and the sheet never changes. Report it instead.
+      const set = function(name, value) {
+        if (name in col) { data[i][col[name]] = value; }
+        else             { missingCols.push(name); }
+      };
+
       // Fields anyone can update
-      if (params.emailFirstName !== undefined) { data[i][col['emailFirstName']] = params.emailFirstName; }
-      if (params.emailLastName  !== undefined) { data[i][col['emailLastName']]  = params.emailLastName; }
-      if (params.isActive       !== undefined) { data[i][col['isActive']]       = params.isActive; }
-      if (params.notes          !== undefined) { data[i][col['notes']]          = params.notes; }
+      if (params.emailFirstName !== undefined) { set('emailFirstName', params.emailFirstName); }
+      if (params.emailLastName  !== undefined) { set('emailLastName',  params.emailLastName); }
+      if (params.isActive       !== undefined) { set('isActive',       params.isActive); }
+      if (params.notes          !== undefined) { set('notes',          params.notes); }
+
+      // rampUp opts this account in and out of runWarmupIncrease. Normalised to
+      // 'Active' / '' so the flag test there matches, and a sender previously
+      // marked 'Done' resumes ramping the moment it is switched back on.
+      if (params.rampUp !== undefined) {
+        const wanted = String(params.rampUp || '').trim().toLowerCase();
+        const isOn   = (wanted === 'active' || wanted === 'true' || wanted === 'yes' || wanted === 'on');
+        set('rampUp', isOn ? 'Active' : '');
+      }
 
       // Admin only fields
-      if (params.dailyLimit     !== undefined) { data[i][col['dailyLimit']]     = parseInt(params.dailyLimit, 10); }
-      if (params.emailAddress   !== undefined) { data[i][col['emailAddress']]   = params.emailAddress; }
-      if (params.webAppUrl      !== undefined) { data[i][col['webAppUrl']]      = params.webAppUrl; }
-      if (params.spreadsheetId  !== undefined) { data[i][col['spreadsheetId']]  = params.spreadsheetId; }
+      if (params.dailyLimit     !== undefined) { set('dailyLimit',    parseInt(params.dailyLimit, 10)); }
+      if (params.emailAddress   !== undefined) { set('emailAddress',  params.emailAddress); }
+      if (params.webAppUrl      !== undefined) { set('webAppUrl',     params.webAppUrl); }
+      if (params.spreadsheetId  !== undefined) { set('spreadsheetId', params.spreadsheetId); }
 
       senderWebApp = String(data[i][col['webAppUrl']] || '').trim();
       senderRow    = data[i];
@@ -2967,6 +3003,11 @@ function handleUpdateSender(params) {
 
     if (!senderRow) {
       return { success: false, error: 'Sender not found: ' + emailID };
+    }
+
+    if (missingCols.length > 0) {
+      log('handleUpdateSender: senderAccounts has no column(s) ' + missingCols.join(', ') +
+          ' — those values were not saved', 'ERROR');
     }
 
     // Write back to senderAccounts
@@ -2999,8 +3040,9 @@ function handleUpdateSender(params) {
       }
     }
 
-    log('handleUpdateSender: updated sender ' + emailID, 'INFO');
-    return { success: true, emailID: emailID };
+    log('handleUpdateSender: updated sender ' + emailID +
+        (missingCols.length ? ' (skipped missing columns: ' + missingCols.join(', ') + ')' : ''), 'INFO');
+    return { success: true, emailID: emailID, missingColumns: missingCols };
 
   } catch(e) {
     log('handleUpdateSender: error — ' + e.message, 'ERROR');
@@ -3300,6 +3342,7 @@ function handleGetSenders(params) {
         repliesReceived:parseInt(row[col['repliesReceived']]||0, 10),
         bouncedEmails:  parseInt(row[col['bouncedEmails']] || 0, 10),
         lastRunTime:    String(row[col['lastRunTime']]    || '').trim(),
+        rampUp:         ('rampUp' in col) ? String(row[col['rampUp']] || '').trim() : undefined,
         notes:          String(row[col['notes']]          || '').trim(),
         tagName:        String(row[col['tagName']]        || '').trim(),
         tagColor:       String(row[col['tagColor']]       || '').trim()
@@ -3418,6 +3461,24 @@ function handleGetMasterTriggers(params) {
   }
 }
 
+// Columns that live on senderAccounts only. Pushing them into a sender's
+// Config sheet would create keys nothing on that side ever reads.
+var SENDER_CONFIG_EXCLUDED = ['rampUp'];
+
+/**
+ * Normalises a sender field before it is written to senderAccounts.
+ * rampUp is the only one that matters today: runWarmupIncrease tests for
+ * 'active'/'true'/'yes', and writes 'Done' when a sender reaches the max, so an
+ * arbitrary string here silently takes the account out of the ramp.
+ */
+function normaliseSenderField_(fieldKey, value) {
+  if (fieldKey !== 'rampUp') { return value; }
+  const wanted = String(value || '').trim().toLowerCase();
+  if (wanted === 'done') { return 'Done'; }
+  return (wanted === 'active' || wanted === 'true' || wanted === 'yes' || wanted === 'on')
+    ? 'Active'
+    : '';
+}
 function handleUpdateSenderConfig(params) {
   // params.senderIds = ['S001','S002'] OR 'all' for everyone
   // params.fields = { dailyLimit: 50, senderFirstName: 'John' } etc.
@@ -3475,7 +3536,7 @@ function handleUpdateSenderConfig(params) {
       Object.keys(fields).forEach(function(fieldKey) {
         const accountCol = colMapping[fieldKey] || fieldKey;
         if (accountCol in col) {
-          data[i][col[accountCol]] = fields[fieldKey];
+          data[i][col[accountCol]] = normaliseSenderField_(fieldKey, fields[fieldKey]);
         }
       });
 
@@ -3483,6 +3544,7 @@ function handleUpdateSenderConfig(params) {
       // Only include fields that are relevant to sender Config
       const configPayload = {};
       Object.keys(fields).forEach(function(fieldKey) {
+        if (SENDER_CONFIG_EXCLUDED.indexOf(fieldKey) !== -1) { return; }
         configPayload[fieldKey] = String(fields[fieldKey]);
       });
 
