@@ -1706,36 +1706,74 @@ function runWarmupIncrease() {
     const saCol     = {};
     saHeaders.forEach(function(h, i) { saCol[String(h).trim()] = i; });
 
-    // Find first active sender to read current limit
-    let currentLimit = 1;
+        // ── Ramp each opted-in sender from its own current limit ──────────────
+    // Reading one sender's limit and applying it to everyone dragged
+    // established accounts back down whenever new ones were added.
+    const hasRampCol = ('rampUp' in saCol);
+    const ramping    = [];   // { rowIndex, emailID, from, to, done }
+
     for (let i = 0; i < saData.length; i++) {
-      if (String(saData[i][saCol['isActive']] || '').trim() === 'Active') {
-        currentLimit = parseInt(saData[i][saCol['dailyLimit']] || 1, 10);
-        break;
+      if (String(saData[i][saCol['isActive']] || '').trim() !== 'Active') { continue; }
+
+      // Without the column, fall back to ramping everyone — the old behaviour,
+      // so this patch is safe before the column is added.
+      const flag = hasRampCol
+        ? String(saData[i][saCol['rampUp']] || '').trim().toLowerCase()
+        : 'active';
+      if (flag !== 'active' && flag !== 'true' && flag !== 'yes') { continue; }
+
+      const from = parseInt(saData[i][saCol['dailyLimit']] || 1, 10);
+      if (from >= warmupMaxLimit) {
+        // Already there: mark it done so it stops being considered.
+        if (hasRampCol) { saData[i][saCol['rampUp']] = 'Done'; }
+        continue;
       }
+
+      let to   = from + warmupIncreaseBy;
+      let done = false;
+      if (to >= warmupMaxLimit) { to = warmupMaxLimit; done = true; }
+
+      if (hasRampCol && done) { saData[i][saCol['rampUp']] = 'Done'; }
+
+      saData[i][saCol['dailyLimit']] = to;
+      ramping.push({
+        emailID: String(saData[i][saCol['emailID']] || '').trim(),
+        from: from, to: to, done: done
+      });
     }
 
-    log('runWarmupIncrease: currentLimit=' + currentLimit, 'INFO');
-
-    // ── Calculate new limit ───────────────────────────────────────────────
-    let newLimit = currentLimit + warmupIncreaseBy;
-    let warmupComplete = false;
-
-    if (newLimit >= warmupMaxLimit) {
-      newLimit      = warmupMaxLimit;
-      warmupComplete = true;
-      log('runWarmupIncrease: warmup complete — reached max limit ' + warmupMaxLimit, 'INFO');
+    if (ramping.length === 0) {
+      log('runWarmupIncrease: no senders are flagged to ramp — nothing to do', 'INFO');
+      return;
     }
 
-    // ── Update ALL senders via handleUpdateSenderConfig ───────────────────
-    const updateResult = handleUpdateSenderConfig({
-      senderIds: 'all',
-      fields:    { dailyLimit: newLimit }
+    // Write the sheet once, then push each new limit to that sender's Config.
+    saSheet.getRange(2, 1, saData.length, saHeaders.length).setValues(saData);
+    SpreadsheetApp.flush();
+
+    let synced = 0, failed = 0;
+    ramping.forEach(function(r) {
+      const res = handleUpdateSenderConfig({
+        senderIds: [r.emailID],
+        fields:    { dailyLimit: r.to }
+      });
+      synced += (res.synced || 0);
+      failed += (res.failed || 0);
     });
 
-    log('runWarmupIncrease: updated all senders to dailyLimit=' + newLimit +
-        ' synced=' + updateResult.synced +
-        ' failed=' + updateResult.failed, 'INFO');
+    // Warmup is complete only when nothing is left ramping.
+    const stillRamping = hasRampCol
+      ? saData.some(function(row) {
+          return String(row[saCol['rampUp']] || '').trim().toLowerCase() === 'active';
+        })
+      : ramping.some(function(r) { return !r.done; });
+
+    const warmupComplete = !stillRamping;
+    const newLimit = Math.max.apply(null, ramping.map(function(r) { return r.to; }));
+
+    log('runWarmupIncrease: ramped ' + ramping.length + ' sender(s), ' +
+        'synced=' + synced + ' failed=' + failed +
+        ' complete=' + warmupComplete, 'INFO');
 
     // ── Update Settings sheet ─────────────────────────────────────────────
     const settingsSheet = ss.getSheetByName('Settings');
@@ -1865,6 +1903,36 @@ function sendDailyDigest() {
       log('sendDailyDigest: error reading masterLeads — ' + e.message, 'WARN');
     }
 
+        // ── 1b. Seed every campaign, including ones with no leads ─────────────
+    try {
+      const campSheet = SpreadsheetApp.openById(MASTER_SHEET_ID).getSheetByName('Campaigns');
+
+      if (campSheet && campSheet.getLastRow() > 1) {
+        const cHeaders = campSheet.getRange(1, 1, 1, campSheet.getLastColumn()).getValues()[0];
+        const cData    = campSheet.getRange(2, 1, campSheet.getLastRow() - 1,
+                                            campSheet.getLastColumn()).getValues();
+        const cCol = {};
+        cHeaders.forEach(function(h, i) { cCol[String(h).trim()] = i; });
+
+        for (let i = 0; i < cData.length; i++) {
+          const cId = String(cData[i][cCol['campaignId']] || '').trim();
+          if (!cId) { continue; }
+
+          const name   = String(cData[i][cCol['campaignName']]   || '').trim() || cId;
+          const status = String(cData[i][cCol['campaignStatus']] || '').trim();
+
+          if (!campStats[cId]) {
+            campStats[cId] = { pending: 0, queued: 0, sent: 0,
+                               replied: 0, bounced: 0, completed: 0 };
+          }
+          campStats[cId].name   = name;
+          campStats[cId].status = status;
+        }
+      }
+    } catch (e) {
+      log('sendDailyDigest: error reading Campaigns — ' + e.message, 'WARN');
+    }
+
     // ── 2. Read senderAccounts stats ─────────────────────────────────────
     const senderStats = { total: 0, active: 0, paused: 0,
                           sentToday: 0, totalSentCount: 0,
@@ -1932,11 +2000,14 @@ function sendDailyDigest() {
     }
 
     // ── 4. Build email body ───────────────────────────────────────────────
-    const replyRate  = leadsStats.total > 0
-      ? ((leadsStats.replied / leadsStats.total) * 100).toFixed(1) + '%'
+    const contacted = leadsStats.sent + leadsStats.replied +
+                      leadsStats.completed + leadsStats.bounced;
+
+    const replyRate  = contacted > 0
+      ? ((leadsStats.replied / contacted) * 100).toFixed(1) + '%'
       : '0%';
-    const bounceRate = leadsStats.total > 0
-      ? ((leadsStats.bounced / leadsStats.total) * 100).toFixed(1) + '%'
+    const bounceRate = contacted > 0
+      ? ((leadsStats.bounced / contacted) * 100).toFixed(1) + '%'
       : '0%';
 
     // Campaign breakdown
@@ -1995,16 +2066,216 @@ function sendDailyDigest() {
       '=== END OF REPORT ==='
     ].join('\n');
 
-    // ── 5. Send the email ─────────────────────────────────────────────────
-    GmailApp.sendEmail(
-      alertsEmail,
-      'Daily Send Report — ' + today + ' — ' + senderStats.sentToday + ' sent today',
-      body
-    );
+        // ── 5. Send the email ─────────────────────────────────────────────────
+      // htmlBody renders in every mail client; `body` stays as the plain-text
+      // fallback for clients that refuse HTML.
+      GmailApp.sendEmail(
+        alertsEmail,
+        'Daily Send Report — ' + today + ' — ' + senderStats.sentToday + ' sent today',
+        body,
+        {
+          name:     'Reach X',
+          htmlBody: buildDigestHtml_({
+            today:            today,
+            leadsStats:       leadsStats,
+            senderStats:      senderStats,
+            campStats:        campStats,
+            contacted:        contacted,
+            yesterdaySent:    yesterdaySent,
+            yesterdayReplies: yesterdayReplies,
+            yesterdayBounces: yesterdayBounces,
+            replyRate:        replyRate,
+            bounceRate:       bounceRate,
+            warmupLine:       warmupLine
+          })
+        }
+      );
 
     log('sendDailyDigest: sent to ' + alertsEmail, 'INFO');
 
   } catch(e) {
     log('sendDailyDigest: error — ' + e.message, 'ERROR');
   }
+}
+
+/**
+ * Renders the daily digest as HTML.
+ *
+ * Written for mail clients, not browsers: tables for layout, every style
+ * inline, no external images or fonts. Gmail strips <style> blocks and most
+ * clients ignore flexbox, so neither is used.
+ */
+function buildDigestHtml_(d) {
+  const esc = function(v) {
+    return String(v === null || v === undefined ? '' : v)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  };
+  const n = function(v) {
+    return Number(v || 0).toLocaleString('en-US');
+  };
+
+  // One headline figure.
+  const stat = function(label, value, sub, color) {
+    return '' +
+      '<td width="25%" style="padding:0 6px;" valign="top">' +
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" ' +
+               'style="background:#f6f8fc;border:1px solid #e3e8f0;border-radius:10px;">' +
+          '<tr><td style="padding:14px 16px;">' +
+            '<div style="font:500 11px/1.4 Arial,sans-serif;color:#64748b;' +
+                 'text-transform:uppercase;letter-spacing:.5px;">' + esc(label) + '</div>' +
+            '<div style="font:600 24px/1.3 Arial,sans-serif;color:' + (color || '#0f172a') + ';' +
+                 'margin-top:4px;">' + esc(value) + '</div>' +
+            (sub ? '<div style="font:400 12px/1.4 Arial,sans-serif;color:#64748b;">' +
+                   esc(sub) + '</div>' : '') +
+          '</td></tr>' +
+        '</table>' +
+      '</td>';
+  };
+
+  const sectionTitle = function(text) {
+    return '<tr><td style="padding:26px 24px 10px;">' +
+             '<div style="font:600 13px/1.4 Arial,sans-serif;color:#0f172a;' +
+                  'text-transform:uppercase;letter-spacing:.6px;">' + esc(text) + '</div>' +
+             '<div style="height:2px;width:34px;background:#4f8ef7;margin-top:6px;"></div>' +
+           '</td></tr>';
+  };
+
+  const row = function(label, value, color) {
+    return '<tr>' +
+      '<td style="padding:9px 0;border-bottom:1px solid #eef1f6;' +
+           'font:400 14px/1.4 Arial,sans-serif;color:#475569;">' + esc(label) + '</td>' +
+      '<td align="right" style="padding:9px 0;border-bottom:1px solid #eef1f6;' +
+           'font:600 14px/1.4 Arial,sans-serif;color:' + (color || '#0f172a') + ';">' +
+           esc(value) + '</td>' +
+    '</tr>';
+  };
+
+  // Campaign table rows
+  let campRows = '';
+  Object.keys(d.campStats).sort().forEach(function(cId) {
+    const c    = d.campStats[cId];
+    const done = c.sent + c.replied + c.completed + c.bounced;
+    const rate = done > 0 ? ((c.replied / done) * 100).toFixed(1) + '%' : '—';
+
+    const paused    = String(c.status || '').toLowerCase() === 'paused';
+    const nameColor = paused ? '#94a3b8' : '#0f172a';
+    const cell = 'padding:9px 8px;border-bottom:1px solid #eef1f6;' +
+                 'font:400 13px/1.4 Arial,sans-serif;color:#475569;';
+
+    campRows +=
+      '<tr>' +
+        '<td style="padding:9px 8px;border-bottom:1px solid #eef1f6;">' +
+          '<div style="font:600 13px/1.4 Arial,sans-serif;color:' + nameColor + ';">' +
+            esc(c.name || cId) + '</div>' +
+          '<div style="font:400 11px/1.4 Arial,sans-serif;color:#94a3b8;">' +
+            esc(cId) + (c.status ? ' &middot; ' + esc(c.status) : '') + '</div>' +
+        '</td>' +
+        '<td align="right" style="' + cell + '">' + n(c.pending)   + '</td>' +
+        '<td align="right" style="' + cell + '">' + n(c.queued)    + '</td>' +
+        '<td align="right" style="' + cell + '">' + n(c.sent)      + '</td>' +
+        '<td align="right" style="padding:9px 8px;border-bottom:1px solid #eef1f6;' +
+             'font:600 13px/1.4 Arial,sans-serif;color:#16a34a;">' + n(c.replied) + '</td>' +
+        '<td align="right" style="' + cell + '">' + esc(rate)      + '</td>' +
+        '<td align="right" style="' + cell + '">' + n(c.completed) + '</td>' +
+      '</tr>';
+  });
+  if (!campRows) {
+    campRows = '<tr><td colspan="7" style="padding:16px 8px;font:400 13px Arial,sans-serif;' +
+               'color:#94a3b8;text-align:center;">No campaigns yet</td></tr>';
+  }
+
+  const th = function(text, align) {
+    return '<td align="' + (align || 'left') + '" style="padding:0 8px 8px;' +
+           'font:500 11px/1.4 Arial,sans-serif;color:#64748b;text-transform:uppercase;' +
+           'letter-spacing:.4px;">' + esc(text) + '</td>';
+  };
+
+  return '' +
+'<!DOCTYPE html><html><body style="margin:0;padding:0;background:#eef2f7;">' +
+'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef2f7;padding:24px 12px;">' +
+'<tr><td align="center">' +
+
+  '<table role="presentation" width="640" cellpadding="0" cellspacing="0" ' +
+         'style="width:640px;max-width:100%;background:#ffffff;border-radius:14px;overflow:hidden;' +
+                'box-shadow:0 1px 3px rgba(15,23,42,.08);">' +
+
+    // Header
+    '<tr><td style="background:#0f1117;padding:22px 24px;">' +
+      '<div style="font:600 18px/1.3 Arial,sans-serif;color:#ffffff;">Reach X</div>' +
+      '<div style="font:400 13px/1.4 Arial,sans-serif;color:#8892a4;margin-top:2px;">' +
+        'Daily send report &middot; ' + esc(d.today) + '</div>' +
+    '</td></tr>' +
+
+    // Yesterday
+    sectionTitle('Yesterday') +
+    '<tr><td style="padding:0 18px;">' +
+      '<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>' +
+        stat('Emails sent', n(d.yesterdaySent)) +
+        stat('Replies', n(d.yesterdayReplies), null, '#16a34a') +
+        stat('Bounces', n(d.yesterdayBounces), null, d.yesterdayBounces > 0 ? '#dc2626' : null) +
+        stat('Sent today', n(d.senderStats.sentToday)) +
+      '</tr></table>' +
+    '</td></tr>' +
+
+    // Senders
+    sectionTitle('Senders') +
+    '<tr><td style="padding:0 24px;">' +
+      '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">' +
+        row('Active', n(d.senderStats.active) + ' of ' + n(d.senderStats.total),
+            d.senderStats.active === 0 ? '#dc2626' : '#16a34a') +
+        row('Sent today', n(d.senderStats.sentToday)) +
+        row('Ramp up', d.warmupLine.replace(/^Warmup:\\s*/, '')) +
+      '</table>' +
+    '</td></tr>' +
+
+    // Lead database
+    sectionTitle('Lead database') +
+    '<tr><td style="padding:0 24px;">' +
+      '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">' +
+        row('Total leads', n(d.leadsStats.total)) +
+        row('Pending', n(d.leadsStats.pending)) +
+        row('Queued', n(d.leadsStats.queued)) +
+        row('Contacted', n(d.contacted)) +
+        row('Awaiting reply', n(d.leadsStats.sent)) +
+        row('Replied', n(d.leadsStats.replied) + '  (' + esc(d.replyRate) + ')', '#16a34a') +
+        row('Bounced', n(d.leadsStats.bounced) + '  (' + esc(d.bounceRate) + ')',
+            d.leadsStats.bounced > 0 ? '#dc2626' : null) +
+        row('Completed', n(d.leadsStats.completed)) +
+        (d.leadsStats.error > 0 ? row('Errors', n(d.leadsStats.error), '#dc2626') : '') +
+      '</table>' +
+    '</td></tr>' +
+
+    // Campaigns
+    sectionTitle('Campaigns') +
+    '<tr><td style="padding:0 24px;">' +
+      '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">' +
+      '<tr>' + th('Campaign') + th('Pending', 'right') + th('Queued', 'right') +
+                 th('Sent', 'right') + th('Replied', 'right') + th('Reply %', 'right') +
+                 th('Done', 'right') + '</tr>' +
+        campRows +
+      '</table>' +
+    '</td></tr>' +
+
+    // All time
+    sectionTitle('All time') +
+    '<tr><td style="padding:0 24px;">' +
+      '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">' +
+        row('Emails sent', n(d.senderStats.totalSentCount)) +
+        row('Replies', n(d.senderStats.repliesReceived), '#16a34a') +
+        row('Bounces', n(d.senderStats.bouncedEmails),
+            d.senderStats.bouncedEmails > 0 ? '#dc2626' : null) +
+      '</table>' +
+    '</td></tr>' +
+
+    // Footer
+    '<tr><td style="padding:24px;">' +
+      '<div style="border-top:1px solid #eef1f6;padding-top:16px;' +
+           'font:400 12px/1.6 Arial,sans-serif;color:#94a3b8;">' +
+        'Generated automatically by Reach X. Reply rate and bounce rate are ' +
+        'measured against total leads.' +
+      '</div>' +
+    '</td></tr>' +
+
+  '</table>' +
+'</td></tr></table></body></html>';
 }
