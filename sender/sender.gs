@@ -1043,12 +1043,38 @@ function notifyMasterControl(masterWebhookUrl, updates, action, senderId) {
       muteHttpExceptions: true
     };
     try {
-      const response = UrlFetchApp.fetch(masterWebhookUrl, options);
-      if (response.getResponseCode() !== 200) {
-        log('notifyMasterControl: non-200 response ' + response.getResponseCode() + ' — saving to cache for retry', 'ERROR');
-        savePendingUpdates_(masterWebhookUrl, batch, action, senderId);
-      } else {
+            const response = UrlFetchApp.fetch(masterWebhookUrl, options);
+      const code     = response.getResponseCode();
+
+      // An Apps Script web app answers HTTP 200 on EVERY path, including the ones
+      // where the handler refused the work — a busy lock, a missing stagingUpdates
+      // sheet, an exception it caught and turned into { success: false }.
+      //
+      // Checking only the status code therefore logged "sent OK" for updates
+      // Master Control never actually recorded. The email had gone out, the inbox
+      // row said Sent, and the lead sat at Queued in masterLeads forever.
+      //
+      // Read the body and trust what it says. Anything other than an explicit
+      // success goes to the retry cache, which re-POSTs in 5-8 minutes.
+      let accepted = false;
+      let reason   = 'HTTP ' + code;
+
+      if (code === 200) {
+        try {
+          const body = JSON.parse(response.getContentText());
+          accepted   = (body.success !== false);
+          if (!accepted) { reason = body.error || 'master control reported failure'; }
+        } catch (parseErr) {
+          reason = 'master control did not return JSON';
+        }
+      }
+
+      if (accepted) {
         log('notifyMasterControl: batch ' + (Math.floor(i / BATCH_SIZE) + 1) + ' sent OK', 'INFO');
+      } else {
+        log('notifyMasterControl: master control did not accept batch ' +
+            (Math.floor(i / BATCH_SIZE) + 1) + ' — ' + reason + ' — caching for retry', 'ERROR');
+        savePendingUpdates_(masterWebhookUrl, batch, action, senderId);
       }
     } catch (e) {
       log('notifyMasterControl: fetch error — ' + e.message + ' — saving to cache for retry', 'ERROR');
