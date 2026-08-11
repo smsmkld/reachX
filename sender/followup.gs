@@ -705,20 +705,30 @@ function sendFollowupEmail(threadId, toEmail, template, leadObj, senderObj, conf
     : messageIdHeader;
 
   // ── Step 5: Build and send raw RFC 2822 plain text email ─────────────────
+  //
+  // A header may only carry ASCII. A curly apostrophe or an em dash in a name or
+  // subject has to travel RFC 2047 encoded, or it arrives as a question mark.
+  const encodeHeader = function(text) {
+    const str = String(text || '');
+    if (!/[^\x00-\x7F]/.test(str)) { return str; }
+    return '=?UTF-8?B?' + Utilities.base64Encode(str, Utilities.Charset.UTF_8) + '?=';
+  };
+
   const rawEmail = [
     'MIME-Version: 1.0',
-    'From: ' + senderName + ' <' + senderEmail + '>',
+    'From: ' + encodeHeader(senderName) + ' <' + senderEmail + '>',
     'To: ' + toEmail,
-    'Subject: ' + replySubject,
+    'Subject: ' + encodeHeader(replySubject),
     'In-Reply-To: ' + messageIdHeader,
     'References: ' + references,
     'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
     '',
-    plainBody
+    Utilities.base64Encode(plainBody, Utilities.Charset.UTF_8)
   ].join('\r\n');
 
   Gmail.Users.Messages.send({
-    raw:      Utilities.base64EncodeWebSafe(rawEmail),
+    raw:      Utilities.base64EncodeWebSafe(rawEmail, Utilities.Charset.UTF_8),
     threadId: cleanThreadId
   }, 'me');
 
