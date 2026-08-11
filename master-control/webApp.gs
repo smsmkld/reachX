@@ -107,7 +107,17 @@ function doPost(e) {
     }
 
     if (action === 'updateSender') {
-     return buildResponse(handleUpdateSender(params), corsHeaders); 
+     return buildResponse(handleUpdateSender(params), corsHeaders);
+    }
+
+    // Admin-only: absent from the Worker's browser allow-list, so only the
+    // admin console's proxy can reach them.
+    if (action === 'addSender') {
+      return buildResponse(handleAddSender(params), corsHeaders);
+    }
+
+    if (action === 'setSenderConfig') {
+      return buildResponse(handleSetSenderConfig(params), corsHeaders);
     }
 
     if (action === 'archiveCampaignLeads') {
@@ -407,6 +417,14 @@ function handleUpdateColdSent(params) {
       return { success: false, error: 'stagingUpdates sheet not found' };
     }
 
+        const batchKey = batchKeyFor_('coldSent', params.senderId || '', updates);
+    if (batchKey && CacheService.getScriptCache().get(batchKey)) {
+      log('handleUpdateColdSent: duplicate batch from ' + params.senderId +
+          ' — already applied, counters untouched', 'WARN');
+      return { success: true, staged: 0, duplicate: true };
+    }
+
+
     const rows = updates.map(function(upd) {
       return [
         new Date().toISOString(), // timestamp
@@ -428,6 +446,7 @@ function handleUpdateColdSent(params) {
     SpreadsheetApp.flush();
 
     // Still increment sender counters — this is fast, no masterLeads touch
+    if (batchKey) { CacheService.getScriptCache().put(batchKey, '1', 7200); }
     incrementSenderCounters(updates.length, 0, params.senderId || '');
 
     log('handleUpdateColdSent: staged ' + rows.length + ' updates', 'INFO');
@@ -472,6 +491,13 @@ function handleUpdateFollowupSent(params) {
     if (!stagingSheet) {
       return { success: false, error: 'stagingUpdates sheet not found' };
     }
+    const batchKey = batchKeyFor_('followupSent', params.senderId || '', updates);
+    if (batchKey && CacheService.getScriptCache().get(batchKey)) {
+      log('handleUpdateFollowupSent: duplicate batch from ' + params.senderId +
+          ' — already applied, counters untouched', 'WARN');
+      return { success: true, staged: 0, duplicate: true };
+    }
+
 
     const rows = updates.map(function(upd) {
       return [
@@ -494,6 +520,7 @@ function handleUpdateFollowupSent(params) {
     SpreadsheetApp.flush();
 
     // Increment sender counters — fast, no masterLeads touch
+    if (batchKey) { CacheService.getScriptCache().put(batchKey, '1', 7200); }
     incrementSenderCounters(0, updates.length, params.senderId || '');
 
     log('handleUpdateFollowupSent: staged ' + rows.length + ' updates', 'INFO');
@@ -927,6 +954,81 @@ function clearTerminalRows(sheet, statuses) {
 
   SpreadsheetApp.flush();
   return removedCount;
+}
+
+function syncWarmupState_() {
+  try {
+    const ss      = SpreadsheetApp.openById(MASTER_SHEET_ID);
+    const sheet   = ss.getSheetByName(SHEET_SENDER_ACCOUNTS);
+    const lastRow = sheet ? sheet.getLastRow() : 0;
+    if (!sheet || lastRow < 2) { return { changed: false }; }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const data    = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+    const col     = {};
+    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+    if (!('dailyLimit' in col)) { return { changed: false }; }
+
+    // Mirror runWarmupIncrease, which takes the highest limit among the senders
+    // that are actually ramping. Fall back to every active sender when none are
+    // opted in, so the number still means something.
+    let rampingMax = 0;
+    let activeMax  = 0;
+    for (let i = 0; i < data.length; i++) {
+      const limit = parseInt(data[i][col['dailyLimit']] || 0, 10);
+      if (!limit) { continue; }
+      const isActive = ('isActive' in col)
+        ? String(data[i][col['isActive']] || '').trim() === 'Active' : true;
+      const isRamping = ('rampUp' in col)
+        ? String(data[i][col['rampUp']] || '').trim() === 'Active' : false;
+      if (isActive && limit > activeMax)  { activeMax  = limit; }
+      if (isRamping && limit > rampingMax) { rampingMax = limit; }
+    }
+
+    const limit = rampingMax || activeMax;
+    if (!limit) { return { changed: false }; }
+
+    const settings = getSettings(MASTER_SHEET_ID);
+    const stored   = parseInt(settings.warmupCurrentLimit || 0, 10);
+    if (stored === limit) { return { changed: false }; }
+
+    const everyDays = parseInt(settings.warmupEveryDays || 3, 10);
+    const next      = addDays(formatDate(new Date()), everyDays);
+
+    setSettingsValues_({
+      warmupCurrentLimit:     String(limit),
+      // Leading apostrophe keeps Sheets from reformatting it into a date value,
+      // which would stop the string comparison in runWarmupIncrease matching.
+      warmupNextIncreaseDate: "'" + next
+    });
+
+    log('syncWarmupState_: senders now at ' + limit + '/day (was ' + stored +
+        ') — next increase moved to ' + next, 'INFO');
+    return { changed: true, limit: limit, nextIncreaseDate: next };
+
+  } catch (e) {
+    log('syncWarmupState_: error — ' + e.message, 'ERROR');
+    return { changed: false };
+  }
+}
+
+
+function batchKeyFor_(action, senderId, updates) {
+  try {
+    const fingerprint = action + '|' + (senderId || '') + '|' +
+      updates.map(function(u) {
+        return String(u.leadId || '') + ':' + String(u.sequenceStep || '');
+      }).join(',');
+    const digest = Utilities.computeDigest(
+      Utilities.DigestAlgorithm.MD5, fingerprint, Utilities.Charset.UTF_8);
+    const hex = digest.map(function(b) {
+      return ('0' + (b < 0 ? b + 256 : b).toString(16)).slice(-2);
+    }).join('');
+    return 'batch_' + hex;
+  } catch (e) {
+    log('batchKeyFor_: ' + e.message + ' — batch will not be de-duplicated', 'WARN');
+    return '';
+  }
 }
 
 
@@ -2285,6 +2387,36 @@ function handleUploadLeads(params) {
       const startRow = sheet.getLastRow() + 1;
       sheet.getRange(startRow, 1, rows.length, headers.length).setValues(rows);
       SpreadsheetApp.flush();
+
+      // New leads reopen a finished campaign. The rows above are stamped Active,
+      // but the distributors read the campaign row and skip anything that is not.
+      try {
+        const campSheet = SpreadsheetApp.openById(MASTER_SHEET_ID).getSheetByName('Campaigns');
+        if (campSheet && campSheet.getLastRow() > 1) {
+          const cHeaders = campSheet.getRange(1, 1, 1, campSheet.getLastColumn()).getValues()[0];
+          const cCol = {};
+          cHeaders.forEach(function(h, j) { cCol[String(h).trim()] = j; });
+
+          if ('campaignId' in cCol && 'campaignStatus' in cCol) {
+            const cData = campSheet.getRange(2, 1, campSheet.getLastRow() - 1, cHeaders.length).getValues();
+            let reopened = false;
+            for (let r = 0; r < cData.length; r++) {
+              if (String(cData[r][cCol['campaignId']] || '').trim() !== campaignId) { continue; }
+              if (String(cData[r][cCol['campaignStatus']] || '').trim() !== 'Completed') { continue; }
+              cData[r][cCol['campaignStatus']] = 'Active';
+              reopened = true;
+            }
+            if (reopened) {
+              campSheet.getRange(2, 1, cData.length, cHeaders.length).setValues(cData);
+              SpreadsheetApp.flush();
+              cascadeCampaignStatus(campaignId, 'Active');
+              log('handleUploadLeads: ' + campaignId + ' was Completed — reopened as Active', 'INFO');
+            }
+          }
+        }
+      } catch (e) {
+        log('handleUploadLeads: could not reopen ' + campaignId + ' — ' + e.message, 'WARN');
+      }
     }
 
     log('handleUploadLeads: inserted=' + rows.length +
@@ -2353,6 +2485,9 @@ function handleGetCampaigns(params) {
           bouncedEmails:       parseInt(data[i][col['bouncedEmails']]     || 0, 10),
           stepsSent:           parseInt(data[i][col['stepsSent']]         || 0, 10),
           contactedCount:      parseInt(data[i][col['contactedCount']]    || 0, 10),
+          finishedCount:       ('finishedCount' in col)
+                                 ? parseInt(data[i][col['finishedCount']] || 0, 10)
+                                 : undefined,
           createdDate:         String(data[i][col['createdDate']]         || '').trim(),
           notes:                 String(data[i][col['notes']]                || '').trim(),
           coldPriorityLimit:     parseFloat(data[i][col['coldPriorityLimit']])     || null,
@@ -2457,7 +2592,15 @@ function handleCreateCampaign(params) {
       rows.push(row);
     }
 
-    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, headers.length).setValues(rows);
+    // Appended rows have no number format yet, so a time-looking string would
+    // be parsed into a 1899 Date and shown as "12/30/1899".
+    const firstNewRow = sheet.getLastRow() + 1;
+    ['windowStart', 'windowEnd'].forEach(function(name) {
+      if (!(name in col)) { return; }
+      sheet.getRange(firstNewRow, col[name] + 1, rows.length, 1).setNumberFormat('@');
+    });
+
+    sheet.getRange(firstNewRow, 1, rows.length, headers.length).setValues(rows);
     SpreadsheetApp.flush();
 
     log('handleCreateCampaign: created ' + campaignId + ' with ' + rows.length + ' steps', 'INFO');
@@ -2623,10 +2766,37 @@ function handleUpdateCampaign(params) {
       set('lastModified', today);
     });
 
+        // ── Normalise the sending window ─────────────────────────────────────
+    // A time-formatted cell comes back from getValues() as a Date anchored to
+    // 30 Dec 1899. A new step clones step 1's row, so that Date lands in a
+    // sheet row that has never had the time format applied — and renders as
+    // "12/30/1899" while step 1 still reads "15:00:00". Writing plain 'HH:mm'
+    // text into text-formatted columns keeps every step readable.
+    const toHHmm_ = function(value) {
+      if (value instanceof Date) {
+        return ('0' + value.getHours()).slice(-2) + ':' +
+               ('0' + value.getMinutes()).slice(-2);
+      }
+      return String(value === null || value === undefined ? '' : value).trim();
+    };
+    const TIME_COLS = ['windowStart', 'windowEnd'];
+
     // ── Rewrite the sheet ────────────────────────────────────────────────
     const out = others.concat(finalRows);
+
+    TIME_COLS.forEach(function(name) {
+      if (!(name in col)) { return; }
+      out.forEach(function(row) { row[col[name]] = toHHmm_(row[col[name]]); });
+    });
+
     sheet.getRange(2, 1, lastRow - 1, headers.length).clearContent();
     if (out.length > 0) {
+      // Format BEFORE writing: setValues() parses a time-looking string back
+      // into a 1899 Date unless the cell is already plain text.
+      TIME_COLS.forEach(function(name) {
+        if (!(name in col)) { return; }
+        sheet.getRange(2, col[name] + 1, out.length, 1).setNumberFormat('@');
+      });
       sheet.getRange(2, 1, out.length, headers.length).setValues(out);
     }
     SpreadsheetApp.flush();
@@ -3042,7 +3212,18 @@ function handleUpdateSender(params) {
 
     log('handleUpdateSender: updated sender ' + emailID +
         (missingCols.length ? ' (skipped missing columns: ' + missingCols.join(', ') + ')' : ''), 'INFO');
-    return { success: true, emailID: emailID, missingColumns: missingCols };
+    // A single sender can still move the fleet's highest limit, which is what
+    // the warmup state tracks. The helper only writes when it actually changed.
+    const warmup = (params.dailyLimit !== undefined) ? syncWarmupState_() : { changed: false };
+
+    return {
+      success: true,
+      emailID: emailID,
+      missingColumns: missingCols,
+      warmupResynced:     warmup.changed,
+      warmupCurrentLimit: warmup.limit,
+      warmupNextIncreaseDate: warmup.nextIncreaseDate
+    };
 
   } catch(e) {
     log('handleUpdateSender: error — ' + e.message, 'ERROR');
@@ -3249,7 +3430,8 @@ var SETTINGS_WRITABLE = [
   'distributionMethod', 'alertsEmail',
   'sendingWindowStart', 'sendingWindowEnd', 'sendingDays', 'timeZone',
   'warmupEnabled', 'warmupStartLimit', 'warmupIncreaseBy',
-  'warmupEveryDays', 'warmupMaxLimit', 'warmupNextIncreaseDate'
+  'warmupEveryDays', 'warmupMaxLimit', 'warmupNextIncreaseDate',
+  'dailyDigestEnabled'
 ];
 
 /**
@@ -3603,13 +3785,19 @@ function handleUpdateSenderConfig(params) {
     log('handleUpdateSenderConfig: updated=' + updatedCount + 
         ' synced=' + synced + ' failed=' + failed, 'INFO');
 
+    // Only when the limit moved — nothing else feeds the warmup state.
+    const warmup = ('dailyLimit' in fields) ? syncWarmupState_() : { changed: false };
+
     return {
       success:      true,
       updated:      updatedCount,
       synced:       synced,
       failed:       failed,
       targetedAll:  targetAll,
-      fieldsChanged: Object.keys(fields)
+      fieldsChanged: Object.keys(fields),
+      warmupResynced:     warmup.changed,
+      warmupCurrentLimit: warmup.limit,
+      warmupNextIncreaseDate: warmup.nextIncreaseDate
     };
 
   } catch(e) {
@@ -4502,8 +4690,7 @@ function writeArchiveMetrics_(archiveSS, campaignId, rows, col) {
     ['Pending',            s.pending],
     ['Queued',             s.queued],
     ['Errors',             s.error],
-    ['', ''],
-    ['Senders used',       Object.keys(senders).length]
+    ['', '']
   ];
 
   Object.keys(senders).sort().forEach(function(id) {
@@ -4721,6 +4908,175 @@ function handleRestartSenderChain(params) {
 
   } catch (e) {
     log('handleRestartSenderChain: error — ' + e.message, 'ERROR');
+    return { success: false, error: e.message };
+  }
+}
+
+/**
+ * Adds a sender to senderAccounts, then seeds its own Config sheet.
+ *
+ * handleUpdateSender only edits rows that already exist, so there was no way to
+ * bring a sender online through the API at all — it had to be typed into the
+ * sheet by hand, which is how a row ends up missing the one column the
+ * distributor needs. Admin-only by placement: the browser allow-list in the
+ * Worker does not include this action, only the admin console's proxy reaches it.
+ *
+ * @param {Object} params
+ *   emailID        - required, e.g. 'S011'. Must not already exist.
+ *   emailAddress   - required, the Gmail address that sends.
+ *   webAppUrl      - required, that sender's /exec URL.
+ *   spreadsheetId  - required, that sender's spreadsheet.
+ *   emailFirstName, emailLastName, dailyLimit, isActive, notes, rampUp - optional.
+ *   config         - optional extra keys written to the sender's Config sheet.
+ * @returns {{ success: boolean, emailID?: string, configSynced?: boolean, error?: string }}
+ */
+function handleAddSender(params) {
+  const emailID       = String(params.emailID       || '').trim();
+  const emailAddress  = String(params.emailAddress  || '').trim();
+  const webAppUrl     = String(params.webAppUrl     || '').trim();
+  const spreadsheetId = String(params.spreadsheetId || '').trim();
+
+  if (!emailID)       { return { success: false, error: 'Missing emailID' }; }
+  if (!emailAddress)  { return { success: false, error: 'Missing emailAddress' }; }
+  if (!webAppUrl)     { return { success: false, error: 'Missing webAppUrl' }; }
+  if (!spreadsheetId) { return { success: false, error: 'Missing spreadsheetId' }; }
+
+  if (!acquireLock(30)) {
+    return { success: false, error: 'Busy — could not acquire lock' };
+  }
+
+  try {
+    const ss    = SpreadsheetApp.openById(MASTER_SHEET_ID);
+    const sheet = ss.getSheetByName(SHEET_SENDER_ACCOUNTS);
+    if (!sheet) { return { success: false, error: 'senderAccounts sheet not found' }; }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const col     = {};
+    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+
+    // A duplicate emailID would give two rows the same identity: counters would
+    // land on whichever matched first and the other would silently never update.
+    const lastRow = sheet.getLastRow();
+    if (lastRow > 1 && 'emailID' in col) {
+      const ids = sheet.getRange(2, col['emailID'] + 1, lastRow - 1, 1).getValues();
+      for (let i = 0; i < ids.length; i++) {
+        if (String(ids[i][0] || '').trim() === emailID) {
+          return { success: false, error: 'Sender already exists: ' + emailID };
+        }
+      }
+    }
+
+    const row = new Array(headers.length).fill('');
+    const set = function(name, value) {
+      if (name in col) { row[col[name]] = value; }
+    };
+
+    set('emailID',        emailID);
+    set('emailAddress',   emailAddress);
+    set('webAppUrl',      webAppUrl);
+    set('spreadsheetId',  spreadsheetId);
+    set('emailFirstName', params.emailFirstName || '');
+    set('emailLastName',  params.emailLastName  || '');
+    set('dailyLimit',     parseInt(params.dailyLimit || 25, 10));
+    set('isActive',       params.isActive || 'Paused');   // never sends on day one by accident
+    set('notes',          params.notes    || '');
+    set('rampUp',         params.rampUp   || '');
+
+    // Counters start at zero, not blank — the distributor parses these.
+    ['sentToday', 'totalSentCount', 'totalLeadsContacted', 'initialSentToday',
+     'followupSentToday', 'repliesReceived', 'bouncedEmails', 'errorsToday'
+    ].forEach(function(name) { set(name, 0); });
+
+    sheet.getRange(lastRow + 1, 1, 1, headers.length).setValues([row]);
+    SpreadsheetApp.flush();
+
+    // Seed the sender's own Config sheet so it knows where to report back to.
+    // syncConfig creates any key it does not already hold.
+    let configSynced = false;
+    const settings = getSettings(MASTER_SHEET_ID);
+    const config = {
+      senderId:            emailID,
+      senderEmail:         emailAddress,
+      senderFirstName:     params.emailFirstName || '',
+      senderLastName:      params.emailLastName  || '',
+      dailyLimit:          String(parseInt(params.dailyLimit || 25, 10)),
+      masterSpreadsheetId: MASTER_SHEET_ID,
+      leadsSpreadsheetId:  settings.leadsSpreadsheetId || '',
+      masterWebhookUrl:    settings.masterWebhookUrl   || ''
+    };
+    Object.keys(params.config || {}).forEach(function(k) {
+      config[k] = String(params.config[k]);
+    });
+
+    try {
+      const res = UrlFetchApp.fetch(webAppUrl, {
+        method: 'post', contentType: 'application/json',
+        payload: JSON.stringify({ action: 'syncConfig', config: config }),
+        muteHttpExceptions: true
+      });
+      configSynced = (res.getResponseCode() === 200);
+    } catch (e) {
+      log('handleAddSender: could not reach ' + emailID + ' to seed Config — ' + e.message, 'WARN');
+    }
+
+    log('handleAddSender: added ' + emailID + ' (config synced: ' + configSynced + ')', 'INFO');
+    return { success: true, emailID: emailID, configSynced: configSynced };
+
+  } catch (e) {
+    log('handleAddSender: error — ' + e.message, 'ERROR');
+    return { success: false, error: e.message };
+  } finally {
+    releaseLock();
+  }
+}
+
+/**
+ * Writes arbitrary key/value pairs straight into one sender's Config sheet.
+ *
+ * updateSenderConfig only carries the handful of fields that also live on
+ * senderAccounts. The rest — masterSpreadsheetId, leadsSpreadsheetId,
+ * masterWebhookUrl, lastColdSendTime — exist only on the sender and had no
+ * write path at all. Admin-only, same as handleAddSender.
+ */
+function handleSetSenderConfig(params) {
+  const emailID = String(params.emailID || '').trim();
+  const config  = params.config || {};
+
+  if (!emailID) { return { success: false, error: 'Missing emailID' }; }
+  if (Object.keys(config).length === 0) { return { success: false, error: 'No config keys provided' }; }
+
+  try {
+    const sender = getActiveSenders().filter(function(s) { return s.emailID === emailID; })[0];
+    if (!sender) {
+      return { success: false, error: 'Sender not found or not active: ' + emailID };
+    }
+    if (!sender.webAppUrl) {
+      return { success: false, error: 'Sender has no webAppUrl: ' + emailID };
+    }
+
+    const res = UrlFetchApp.fetch(sender.webAppUrl, {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify({ action: 'syncConfig', config: config }),
+      muteHttpExceptions: true
+    });
+
+    if (res.getResponseCode() !== 200) {
+      return { success: false, error: 'Sender returned HTTP ' + res.getResponseCode() };
+    }
+
+    let body = {};
+    try { body = JSON.parse(res.getContentText()); } catch (e) {
+      return { success: false, error: 'Sender did not return JSON' };
+    }
+    if (body.success !== true) {
+      return { success: false, error: body.error || 'Sender rejected the config write' };
+    }
+
+    log('handleSetSenderConfig: wrote ' + Object.keys(config).length + ' key(s) to ' + emailID, 'INFO');
+    return { success: true, emailID: emailID, written: Object.keys(config).length };
+
+  } catch (e) {
+    log('handleSetSenderConfig: error — ' + e.message, 'ERROR');
     return { success: false, error: e.message };
   }
 }
