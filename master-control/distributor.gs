@@ -436,7 +436,13 @@ function distributeCold() {
       log('distributeCold: updated ' + dbUpdates.length + ' leads in DB', 'INFO');
     }
 
-    log('distributeCold: completed successfully', 'INFO');
+    if (dbUpdates.length === 0 && leads.length > 0) {
+      log('distributeCold: completed but distributed 0 of ' + leads.length +
+          ' eligible lead(s) — every sender was skipped, see the WARN lines above', 'ERROR');
+    } else {
+      log('distributeCold: completed successfully — ' + dbUpdates.length + ' of ' +
+          leads.length + ' eligible lead(s) distributed', 'INFO');
+    }
 
     // Kick off sending chain on all assigned senders.
     // Each sender runs scheduleDailySends() synchronously inside this POST, so at
@@ -587,8 +593,9 @@ function distributeFollowups() {
           const status = JSON.parse(responses[r].getContentText());
           const sender = allSendersMap[batchMeta[r].emailID];
           if (sender) {
-            sender.existingColdQueued     = status.coldQueued     || 0;
-            sender.existingFollowupQueued = status.followupQueued || 0;
+          sender.existingColdQueued     = status.coldQueued     || 0;
+          sender.existingFollowupQueued = status.followupQueued || 0;
+            sender.statusKnown            = true;
           }
         } catch(e) { continue; }
       }
@@ -859,7 +866,13 @@ function distributeFollowups() {
       log('distributeFollowups: updated ' + dbUpdates.length + ' leads in DB', 'INFO');
     }
 
-    log('distributeFollowups: completed successfully', 'INFO');
+    if (dbUpdates.length === 0 && leads.length > 0) {
+      log('distributeFollowups: completed but distributed 0 of ' + leads.length +
+          ' eligible lead(s) — every sender was skipped, see the WARN lines above', 'ERROR');
+    } else {
+      log('distributeFollowups: completed successfully — ' + dbUpdates.length + ' of ' +
+          leads.length + ' eligible lead(s) distributed', 'INFO');
+    }
 
     // Same budget guard as distributeCold — see the note there.
     if (isTimeLimitApproaching_()) {
@@ -1577,6 +1590,26 @@ function continueFollowupDistribution() {
   distributeFollowups();
 }
 
+function runChainHealthCheck() {
+  try {
+    const res = handleCheckSenderChains({ autoFix: true });
+    if (!res || res.success !== true) {
+      log('runChainHealthCheck: check failed — ' + ((res && res.error) || 'no result'), 'ERROR');
+      return;
+    }
+    if (res.stalled > 0) {
+      log('runChainHealthCheck: ' + res.stalled + ' sender(s) had queued work and no chain — ' +
+          'restarted ' + (res.restarted !== undefined ? res.restarted : res.stalled) +
+          '. Repeat offenders usually mean orphaned triggers on that sender.', 'ERROR');
+    } else {
+      log('runChainHealthCheck: ' + res.checked + ' sender(s) checked, all healthy', 'INFO');
+    }
+  } catch (e) {
+    log('runChainHealthCheck: error — ' + e.message, 'ERROR');
+  }
+}
+
+
 
 function setupAllMasterTriggers() {
   // Delete ALL existing time-based triggers first
@@ -1638,10 +1671,13 @@ function setupAllMasterTriggers() {
     .create();
 
   // Every 20 minutes — Process staging updates
-  ScriptApp.newTrigger('processStagingUpdates')
-    .timeBased()
-    .everyMinutes(10)
-    .create();
+  ScriptApp.newTrigger('runChainHealthCheck')
+    .timeBased().everyDays(1).atHour(12).nearMinute(0)
+    .inTimezone('Africa/Cairo').create();
+
+  ScriptApp.newTrigger('runChainHealthCheck')
+    .timeBased().everyDays(1).atHour(16).nearMinute(0)
+    .inTimezone('Africa/Cairo').create();
 
   // 11:00 PM — Scan for bounces
   ScriptApp.newTrigger('scanAllSendersForBounces')
@@ -1872,6 +1908,12 @@ function sendDailyDigest() {
       return;
     }
 
+    const digestSetting = String(settings.dailyDigestEnabled || '').trim().toUpperCase();
+    if (digestSetting === 'FALSE' || digestSetting === 'OFF' || digestSetting === 'NO') {
+      log('sendDailyDigest: dailyDigestEnabled is off — skipping', 'INFO');
+      return;
+    }
+
     const today = formatDate(new Date());
 
     // ── 1. Read masterLeads stats ─────────────────────────────────────────
@@ -2099,7 +2141,8 @@ function sendDailyDigest() {
       // fallback for clients that refuse HTML.
       GmailApp.sendEmail(
         alertsEmail,
-        'Daily Send Report — ' + today + ' — ' + senderStats.sentToday + ' sent today',
+        'Daily Send Report — ' + today + ' — ' + yesterdaySent + ' sent yesterday' +
+          (yesterdayReplies ? ', ' + yesterdayReplies + ' repl' + (yesterdayReplies === 1 ? 'y' : 'ies') : ''),
         body,
         {
           name:     'Reach X',
