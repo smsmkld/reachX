@@ -1036,48 +1036,58 @@ function notifyMasterControl(masterWebhookUrl, updates, action, senderId) {
   for (let i = 0; i < updates.length; i += BATCH_SIZE) {
     const batch   = updates.slice(i, i + BATCH_SIZE);
     const payload = JSON.stringify({ action: action, updates: batch, senderId: senderId || '' });
-    const options = {
+        const options = {
       method:             'post',
       contentType:        'application/json',
       payload:            payload,
+      followRedirects:    true,
       muteHttpExceptions: true
     };
-    try {
-            const response = UrlFetchApp.fetch(masterWebhookUrl, options);
-      const code     = response.getResponseCode();
 
-      // An Apps Script web app answers HTTP 200 on EVERY path, including the ones
-      // where the handler refused the work — a busy lock, a missing stagingUpdates
-      // sheet, an exception it caught and turned into { success: false }.
-      //
-      // Checking only the status code therefore logged "sent OK" for updates
-      // Master Control never actually recorded. The email had gone out, the inbox
-      // row said Sent, and the lead sat at Queued in masterLeads forever.
-      //
-      // Read the body and trust what it says. Anything other than an explicit
-      // success goes to the retry cache, which re-POSTs in 5-8 minutes.
-      let accepted = false;
-      let reason   = 'HTTP ' + code;
+    // /exec answers with a 302 to script.googleusercontent.com and UrlFetchApp
+    // follows it. That second hop is where Google intermittently serves an HTML
+    // error or sign-in page instead of the handler's JSON — which is what shows
+    // up as "invalid JSON". It almost always clears immediately, so try inline
+    // before falling back to the slow cache-and-retry path.
+    //
+    // An Apps Script web app answers HTTP 200 on EVERY path, including the ones
+    // where the handler refused the work — a busy lock, a missing stagingUpdates
+    // sheet, an exception it caught and turned into { success: false }. So the
+    // body decides, not the status code.
+    let accepted = false;
+    let reason   = 'not attempted';
 
-      if (code === 200) {
-        try {
-          const body = JSON.parse(response.getContentText());
-          accepted   = (body.success !== false);
-          if (!accepted) { reason = body.error || 'master control reported failure'; }
-        } catch (parseErr) {
-          reason = 'master control did not return JSON';
+    for (let attempt = 1; attempt <= 3 && !accepted; attempt++) {
+      if (attempt > 1) { Utilities.sleep(1500 * (attempt - 1)); }
+      try {
+        const response = UrlFetchApp.fetch(masterWebhookUrl, options);
+        const code     = response.getResponseCode();
+        reason = 'HTTP ' + code;
+
+        if (code === 200) {
+          try {
+            const body = JSON.parse(response.getContentText());
+            // Require an EXPLICIT success. The old test was body.success !== false,
+            // which accepted {} and any other valid JSON that is not our shape, so
+            // a stray page that happened to parse counted as delivered.
+            accepted = (body && body.success === true);
+            if (!accepted) {
+              reason = (body && body.error) ? body.error : 'master control reported failure';
+            }
+          } catch (parseErr) {
+            reason = 'master control did not return JSON';
+          }
         }
+      } catch (fetchErr) {
+        reason = fetchErr.message;
       }
+    }
 
-      if (accepted) {
-        log('notifyMasterControl: batch ' + (Math.floor(i / BATCH_SIZE) + 1) + ' sent OK', 'INFO');
-      } else {
-        log('notifyMasterControl: master control did not accept batch ' +
-            (Math.floor(i / BATCH_SIZE) + 1) + ' — ' + reason + ' — caching for retry', 'ERROR');
-        savePendingUpdates_(masterWebhookUrl, batch, action, senderId);
-      }
-    } catch (e) {
-      log('notifyMasterControl: fetch error — ' + e.message + ' — saving to cache for retry', 'ERROR');
+    if (accepted) {
+      log('notifyMasterControl: batch ' + (Math.floor(i / BATCH_SIZE) + 1) + ' sent OK', 'INFO');
+    } else {
+      log('notifyMasterControl: master control did not accept batch ' +
+          (Math.floor(i / BATCH_SIZE) + 1) + ' — ' + reason + ' — caching for retry', 'ERROR');
       savePendingUpdates_(masterWebhookUrl, batch, action, senderId);
     }
   }
@@ -1145,7 +1155,11 @@ function retryPendingUpdates() {
   for (let k = 0; k < keys.length; k++) {
     const key      = keys[k];
     const valueStr = cache.get(key);
-    if (!valueStr) { continue; } // expired
+    if (!valueStr) {
+      log('retryPendingUpdates: key ' + key + ' expired before it could be delivered — ' +
+          'those sends are recorded on the sender but not in masterLeads', 'ERROR');
+      continue;
+    }
 
     let pending;
     try { pending = JSON.parse(valueStr); } catch (e) { continue; }
@@ -1162,12 +1176,26 @@ function retryPendingUpdates() {
     };
 
     try {
-      const response = UrlFetchApp.fetch(pending.masterWebhookUrl, options);
-      if (response.getResponseCode() === 200) {
+            const response = UrlFetchApp.fetch(pending.masterWebhookUrl, options);
+      const code = response.getResponseCode();
+      let ok  = false;
+      let why = 'HTTP ' + code;
+
+      if (code === 200) {
+        try {
+          const body = JSON.parse(response.getContentText());
+          ok = (body && body.success === true);
+          if (!ok) { why = (body && body.error) ? body.error : 'master control reported failure'; }
+        } catch (parseErr) {
+          why = 'master control did not return JSON';
+        }
+      }
+
+      if (ok) {
         cache.remove(key);
-        log('retryPendingUpdates: key ' + key + ' succeeded — removed from cache', 'INFO');
+        log('retryPendingUpdates: key ' + key + ' accepted — removed from cache', 'INFO');
       } else {
-        log('retryPendingUpdates: key ' + key + ' still failing (' + response.getResponseCode() + ') — will retry again', 'WARN');
+        log('retryPendingUpdates: key ' + key + ' still failing (' + why + ') — will retry again', 'WARN');
         stillFailing.push(key);
       }
     } catch (e) {
