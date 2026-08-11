@@ -131,7 +131,7 @@ function syncCampaignStats(masterSheetId, leadsSheetId) {
 
       if (!stats[cId]) {
         stats[cId] = { totalLeads: 0, sentCount: 0, replyCount: 0, pendingCount: 0,
-                      bouncedEmails: 0, stepsSent: 0, contactedCount: 0 };
+                      bouncedEmails: 0, stepsSent: 0, contactedCount: 0, finishedCount: 0 };
       }
       stats[cId].totalLeads++;
       // Every step delivered, so follow-ups move the progress bar too.
@@ -139,6 +139,24 @@ function syncCampaignStats(masterSheetId, leadsSheetId) {
       if (step > 0) {
         stats[cId].stepsSent += step;
         stats[cId].contactedCount++;    // counted once per lead, not per send
+      }
+
+      // A lead is FINISHED when nothing further will ever be sent to it.
+      //
+      // stepsSent alone cannot express this. A lead that replies at step 1 of 2
+      // stops there and contributes 1 against a target of 2, so a campaign with
+      // any replies at all can never reach 100% — 270 leads with 7 replies tops
+      // out at 98.7%, and the bar sits at 99% forever with nothing left to send.
+      const leadSteps = ('totalSequenceSteps' in lCol)
+        ? parseInt(leadsData[i][lCol['totalSequenceSteps']] || 0, 10) : 0;
+      const seqStatus = ('sequenceStatus' in lCol)
+        ? String(leadsData[i][lCol['sequenceStatus']] || '').trim() : '';
+
+      if (replyStatus === 'Replied' ||
+          bounceStatus === 'Bounced' ||
+          seqStatus === 'Completed' ||
+          (step > 0 && leadSteps > 0 && step >= leadSteps)) {
+        stats[cId].finishedCount++;
       }
       if (status === 'Sent' || status === 'Completed')  { stats[cId].sentCount++;    }
       if (replyStatus === 'Replied')                    { stats[cId].replyCount++;   }
@@ -157,6 +175,7 @@ function syncCampaignStats(masterSheetId, leadsSheetId) {
     campHeaders.forEach(function(h, i) { cCol[String(h).trim()] = i; });
 
     const today = formatDate(new Date());
+    const completed = [];   // cascaded after the sheet write, not during it
 
     for (let i = 0; i < campData.length; i++) {
       const cId = String(campData[i][cCol['campaignId']] || '').trim();
@@ -165,8 +184,10 @@ function syncCampaignStats(masterSheetId, leadsSheetId) {
       // A campaign with no leads left is absent from stats. Treat that as
       // zeros instead of skipping the row, or its counters freeze forever.
       const s = stats[cId] || {
-        totalLeads: 0, sentCount: 0, replyCount: 0, pendingCount: 0, bouncedEmails: 0
+        totalLeads: 0, sentCount: 0, replyCount: 0, pendingCount: 0, bouncedEmails: 0,
+        stepsSent: 0, contactedCount: 0, finishedCount: 0
       };
+      if ('finishedCount' in cCol) { campData[i][cCol['finishedCount']] = s.finishedCount; }
       if ('totalLeads'   in cCol) { campData[i][cCol['totalLeads']]   = s.totalLeads;   }
       if ('sentCount'    in cCol) { campData[i][cCol['sentCount']]    = s.sentCount;    }
       if ('replyCount'   in cCol) { campData[i][cCol['replyCount']]   = s.replyCount;   }
@@ -181,11 +202,36 @@ function syncCampaignStats(masterSheetId, leadsSheetId) {
         const existing = String(campData[i][cCol['createdDate']] || '').trim();
         if (!existing) { campData[i][cCol['createdDate']] = today; }
       }
+
+      // Close a campaign that has nothing left to send.
+      //
+      // Only Active is touched. Paused is a decision someone made, and rewriting
+      // it here would undo that silently. Uploading new leads sets it back to
+      // Active — see handleUploadLeads.
+      if ('campaignStatus' in cCol) {
+        const current = String(campData[i][cCol['campaignStatus']] || '').trim();
+        if (current === 'Active' && s.totalLeads > 0 && s.finishedCount >= s.totalLeads) {
+          campData[i][cCol['campaignStatus']] = 'Completed';
+          completed.push(cId);
+        }
+      }
     }
 
     // Write back in ONE call
     campSheet.getRange(2, 1, campData.length, campHeaders.length).setValues(campData);
     SpreadsheetApp.flush();
+
+    // Push the new status down to the leads, so the distributors stop
+    // considering them and the app agrees with the sheet.
+    completed.forEach(function(cId) {
+      try {
+        cascadeCampaignStatus(cId, 'Completed');
+        log('syncCampaignStats: ' + cId + ' finished — every lead is done, marked Completed', 'INFO');
+      } catch (e) {
+        log('syncCampaignStats: could not cascade Completed for ' + cId + ' — ' + e.message, 'WARN');
+      }
+    });
+
     log('syncCampaignStats: updated stats for ' + Object.keys(stats).length + ' campaigns', 'INFO');
 
   } catch (e) {
