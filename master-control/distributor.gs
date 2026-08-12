@@ -40,7 +40,7 @@ const ACTION_WRITE_FOLLOWUP_INBOX = 'writeFollowupInbox'; // HARDCODED — verif
 const LOCK_WAIT_SECONDS = 10; // HARDCODED — verify this
 
 // Max leads to check per distribution run (safety cap for 6-min execution limit)
-const MAX_LEADS_TO_SCAN = 60000; // HARDCODED — verify this
+const MAX_LEADS_TO_SCAN = 99999; // HARDCODED — verify this
 
 // Webhook batch size — never POST one lead at a time
 const WEBHOOK_BATCH_SIZE = 50; // HARDCODED — verify this
@@ -1021,6 +1021,23 @@ function getEligibleColdLeads(leadsSheetId) {
 
     // Read entire sheet in ONE call (capped at MAX_LEADS_TO_SCAN for safety)
     const rowsToRead = Math.min(lastRow - 1, MAX_LEADS_TO_SCAN);
+
+    // The cap truncates from the BOTTOM — the newest leads are the ones that
+    // disappear, and they disappear silently. Never let that pass unnoticed.
+    if ((lastRow - 1) > MAX_LEADS_TO_SCAN) {
+      const hidden = (lastRow - 1) - MAX_LEADS_TO_SCAN;
+      log('getEligibleColdLeads: SHEET OVER CAP — ' + hidden + ' newest leads are ' +
+          'INVISIBLE to distribution. Archive completed campaigns now.', 'ERROR');
+      try {
+        const s = getSettings(MASTER_SHEET_ID);
+        if (s.alertsEmail) {
+          MailApp.sendEmail(s.alertsEmail,
+            '[reachX] masterLeads over ' + MAX_LEADS_TO_SCAN + ' rows',
+            hidden + ' leads past row ' + (MAX_LEADS_TO_SCAN + 1) + ' are not being ' +
+            'distributed. Archive completed campaigns to bring the sheet back under the cap.');
+        }
+      } catch (e) { /* alerting must never break distribution */ }
+    }
     const headers    = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     const data       = sheet.getRange(2, 1, rowsToRead, sheet.getLastColumn()).getValues();
 
@@ -1029,6 +1046,12 @@ function getEligibleColdLeads(leadsSheetId) {
     // Build column index map
     const col = {};
     headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+
+    // Honor the blocklist at QUEUE time, not only at upload. Loaded once here —
+    // getBlocklist_() returns O(1) lookup objects, so this costs one sheet read.
+    const bl_             = getBlocklist_();
+    const blockedEmails_  = bl_.blockedEmails;
+    const blockedDomains_ = bl_.blockedDomains;
 
     // Filter in-memory — no sheet reads inside the loop
     for (let i = 0; i < data.length; i++) {
@@ -1041,6 +1064,11 @@ function getEligibleColdLeads(leadsSheetId) {
 
       // Cold eligible: never contacted, active campaign, no reply
       const bounceStatus = String(row[col['bounceStatus']] || '').trim();
+
+      const leadEmail_ = String(row[col['email']] || '').trim().toLowerCase();
+      if (blockedEmails_[leadEmail_]) { continue; }
+      const atIdx_ = leadEmail_.indexOf('@');
+      if (atIdx_ > -1 && blockedDomains_[leadEmail_.slice(atIdx_ + 1)]) { continue; }
 
       if (status !== 'Pending')        { continue; }
       if (sequenceStep !== 0)          { continue; }
@@ -1101,6 +1129,15 @@ function getEligibleFollowupLeads(leadsSheetId) {
     }
 
     const rowsToRead = Math.min(lastRow - 1, MAX_LEADS_TO_SCAN);
+
+    // Same bottom-truncation problem as the cold path — leads past the cap stop
+    // getting follow-ups with no error anywhere.
+    if ((lastRow - 1) > MAX_LEADS_TO_SCAN) {
+      const hidden = (lastRow - 1) - MAX_LEADS_TO_SCAN;
+      log('getEligibleFollowupLeads: SHEET OVER CAP — ' + hidden + ' newest leads are ' +
+          'INVISIBLE to follow-ups. Archive completed campaigns now.', 'ERROR');
+    }
+
     const headers    = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     const data       = sheet.getRange(2, 1, rowsToRead, sheet.getLastColumn()).getValues();
 
@@ -1108,6 +1145,13 @@ function getEligibleFollowupLeads(leadsSheetId) {
 
     const col = {};
     headers.forEach(function(h, i) { col[String(h).trim()] = i; });
+
+    // Honor the blocklist at QUEUE time, not only at upload. Someone who opts
+    // out after their lead was uploaded must not receive the rest of the
+    // sequence. Loaded once here — it returns O(1) lookup objects.
+    const bl_            = getBlocklist_();
+    const blockedEmails_ = bl_.blockedEmails;
+    const blockedDomains_= bl_.blockedDomains;
 
     for (let i = 0; i < data.length; i++) {
       const row = data[i];
@@ -1124,6 +1168,12 @@ function getEligibleFollowupLeads(leadsSheetId) {
       const sequenceStatusVal  = String(row[col['sequenceStatus']]     || '').trim();
 
       const bounceStatus = String(row[col['bounceStatus']] || '').trim();
+
+     // Blocklist gate — must come first, before any other filter.
+      const leadEmail_ = String(row[col['email']] || '').trim().toLowerCase();
+      if (blockedEmails_[leadEmail_]) { continue; }
+      const atIdx_ = leadEmail_.indexOf('@');
+      if (atIdx_ > -1 && blockedDomains_[leadEmail_.slice(atIdx_ + 1)]) { continue; }
 
       if (status !== 'Sent')                 { continue; }
       if (sequenceStep <= 0)                 { continue; }
@@ -1670,7 +1720,15 @@ function setupAllMasterTriggers() {
     .inTimezone('Africa/Cairo')
     .create();
 
-  // Every 20 minutes — Process staging updates
+  // Every 10 minutes — Apply staged sender updates to masterLeads.
+  // Without this, sends are recorded in stagingUpdates and never reach
+  // masterLeads: leads stay Queued forever and follow-ups never fire.
+  ScriptApp.newTrigger('processStagingUpdates')
+    .timeBased()
+    .everyMinutes(10)
+    .create();
+
+  // Chain health checks — restart senders with queued work and no chain
   ScriptApp.newTrigger('runChainHealthCheck')
     .timeBased().everyDays(1).atHour(12).nearMinute(0)
     .inTimezone('Africa/Cairo').create();
@@ -1706,8 +1764,8 @@ function setupAllMasterTriggers() {
     .inTimezone('Africa/Cairo')
     .create();
 
-  log('setupAllMasterTriggers: all 8 triggers created successfully', 'INFO');
-  Logger.log('✅ All 8 Master Control triggers created successfully.');
+  log('setupAllMasterTriggers: all 12 triggers created successfully', 'INFO');
+  Logger.log('✅ All 12 Master Control triggers created successfully.');
 }
 
 // ============================================================================
@@ -1788,8 +1846,13 @@ function runWarmupIncrease() {
 
       const from = parseInt(saData[i][saCol['dailyLimit']] || 1, 10);
       if (from >= warmupMaxLimit) {
-        // Already there: mark it done so it stops being considered.
-        if (hasRampCol) { saData[i][saCol['rampUp']] = 'Done'; }
+        // Already at max. Mark Done in memory AND on the sheet — since we now
+        // write per-row instead of the whole array, an in-memory flag alone
+        // never persists and the sender reads as 'Active' forever.
+        if (hasRampCol) {
+          saData[i][saCol['rampUp']] = 'Done';
+          saSheet.getRange(i + 2, saCol['rampUp'] + 1).setValue('Done');
+        }
         continue;
       }
 
@@ -1811,8 +1874,19 @@ function runWarmupIncrease() {
       return;
     }
 
-    // Write the sheet once, then push each new limit to that sender's Config.
-    saSheet.getRange(2, 1, saData.length, saHeaders.length).setValues(saData);
+    // Write one row per ramped sender rather than the whole array — a full-array
+    // write reverts any counter update that landed since the read at the top.
+    ramping.forEach(function (r) {
+      for (let i = 0; i < saData.length; i++) {
+        if (String(saData[i][saCol['emailID']] || '').trim() === r.emailID) {
+          saSheet.getRange(i + 2, saCol['dailyLimit'] + 1).setValue(r.to);
+          if (hasRampCol && r.done) {
+            saSheet.getRange(i + 2, saCol['rampUp'] + 1).setValue('Done');
+          }
+          break;
+        }
+      }
+    });
     SpreadsheetApp.flush();
 
     let synced = 0, failed = 0;
@@ -1874,13 +1948,28 @@ function runWarmupIncrease() {
         ' warmupComplete=' + warmupComplete, 'INFO');
 
     // ── Per-sender warmup tracking in senderAccounts ──────────────────────
-    // Update warmupCurrentLimit column if it exists
+    // Write ONE ROW PER RAMPED SENDER, with its OWN new limit.
+    //
+    // The old code wrote the whole saData array here. That array was read
+    // minutes ago (before the per-sender config sync above), so writing it back
+    // reverted every sentToday/totalSentCount that incrementSenderCounters
+    // recorded in the meantime — senders then under-count and send past their
+    // daily limit while warming. It also stamped one shared newLimit onto every
+    // row, including paused senders and ones held deliberately lower.
     if ('warmupCurrentLimit' in saCol) {
+      const idByEmail = {};
       for (let i = 0; i < saData.length; i++) {
-        saData[i][saCol['warmupCurrentLimit']] = newLimit;
+        idByEmail[String(saData[i][saCol['emailID']] || '').trim()] = i + 2; // sheet row
       }
-      saSheet.getRange(2, 1, saData.length, saHeaders.length).setValues(saData);
+      ramping.forEach(function (r) {
+        const rowNum = idByEmail[r.emailID];
+        if (!rowNum) { return; }
+        // Single-cell write — cannot clobber a concurrent counter update.
+        saSheet.getRange(rowNum, saCol['warmupCurrentLimit'] + 1).setValue(r.to);
+      });
       SpreadsheetApp.flush();
+      log('runWarmupIncrease: warmupCurrentLimit written for ' + ramping.length +
+          ' ramped sender(s), each at its own limit', 'INFO');
     }
 
     log('runWarmupIncrease: completed — all senders now at ' + newLimit + '/day', 'INFO');
