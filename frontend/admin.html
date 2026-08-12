@@ -1,0 +1,1873 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Reach X — Admin</title>
+<!-- Inline SVG, so the tab icon needs no network request and cannot be blocked
+     by the CSP. Purple shield: the admin tab is identifiable at a glance among
+     a row of tenant-app tabs, which is the point. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23a855f7'/%3E%3Cpath d='M16 6l8 3v7c0 5-3.4 8.7-8 10-4.6-1.3-8-5-8-10V9l8-3z' fill='%23fff'/%3E%3Cpath d='M12.5 16.2l2.4 2.4 5-5' stroke='%23a855f7' stroke-width='2.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+<style>
+:root {
+  --bg: #0b0d13; --card: #12151d; --card-2: #171b25;
+  --border: #232733; --text: #e6e9f0; --muted: #8b93a7; --muted-dim: #5b6274;
+  --accent: #3b82f6; --accent-dim: #3b82f61a;
+  --green: #22c55e; --red: #ef4444; --orange: #f59e0b; --purple: #a855f7;
+  --radius: 10px; --radius-lg: 14px;
+  --shadow: 0 10px 30px rgba(0,0,0,.45);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, sans-serif;
+  font-size: 13.5px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+h1 { font-size: 20px; letter-spacing: -.3px; }
+h2 { font-size: 15px; }
+h3 { font-size: 14.5px; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+/* ── Admin is visually distinct from the tenant app on purpose. Acting on the
+   wrong system because two consoles looked alike is a class of mistake worth
+   designing out. ─────────────────────────────────────────────────────────── */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; padding: 12px 20px;
+  background: linear-gradient(90deg, #2a1338, #14161f 60%);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 30;
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+.brand .logo {
+  width: 30px; height: 30px; border-radius: 8px;
+  background: var(--purple); color: #fff;
+  display: grid; place-items: center; font-size: 14px;
+}
+.brand .tag {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .09em;
+  background: var(--purple); color: #fff; padding: 2px 7px; border-radius: 20px;
+}
+.topbar-right { display: flex; align-items: center; gap: 12px; }
+.who { color: var(--muted); font-size: 12.5px; }
+
+.wrap { max-width: 1240px; margin: 0 auto; padding: 20px; }
+.tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); margin-bottom: 18px; }
+.tabs button {
+  background: none; border: 0; border-bottom: 2px solid transparent;
+  color: var(--muted); font: inherit; font-weight: 500;
+  padding: 9px 14px; cursor: pointer;
+}
+.tabs button.active { color: var(--text); border-bottom-color: var(--purple); }
+
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-lg); }
+.card-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--border);
+}
+.card-body { padding: 16px; }
+.mt-16 { margin-top: 16px; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.row-end { margin-left: auto; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 700px) { .grid-2 { grid-template-columns: 1fr; } }
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  background: var(--card-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 13px; font: inherit; font-size: 12.5px; font-weight: 500;
+  cursor: pointer; position: relative; white-space: nowrap;
+}
+.btn:hover:not(:disabled) { border-color: #3b4152; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-danger  { background: var(--red); border-color: var(--red); color: #fff; }
+.btn-ghost   { background: transparent; }
+.btn-sm      { padding: 5px 9px; font-size: 12px; }
+.btn.is-loading { color: transparent !important; pointer-events: none; }
+.btn.is-loading > * { visibility: hidden; }
+.btn.is-loading::after {
+  content: ''; position: absolute; inset: 0; margin: auto;
+  width: 14px; height: 14px;
+  border: 2px solid rgba(255,255,255,.3); border-top-color: #fff;
+  border-radius: 50%; animation: spin .6s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+body.is-busy .btn:not(.is-loading), body.is-busy .tabs { opacity: .5; pointer-events: none; }
+body.is-busy .modal-backdrop .btn:not(.is-loading) { opacity: 1; pointer-events: auto; }
+
+.icon-btn {
+  width: 30px; height: 30px; display: grid; place-items: center;
+  background: transparent; border: 1px solid var(--border); border-radius: 7px;
+  color: var(--muted); cursor: pointer; position: relative;
+}
+.icon-btn:hover:not(:disabled) { color: var(--text); border-color: #3b4152; }
+.icon-btn:disabled { opacity: .45; cursor: not-allowed; }
+.icon-btn.plain { border-color: transparent; }
+.icon-btn.danger:hover { color: var(--red); border-color: var(--red); }
+
+.field { margin-bottom: 13px; }
+.field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+input, select, textarea {
+  width: 100%; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 11px; font: inherit; font-size: 13px;
+}
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+input:disabled { opacity: .55; }
+.field-help { font-size: 11.5px; color: var(--muted-dim); margin-top: 4px; line-height: 1.5; }
+
+table { width: 100%; border-collapse: collapse; }
+th {
+  text-align: left; font-size: 10.5px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .06em; color: var(--muted-dim);
+  padding: 9px 12px; border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+td { padding: 11px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+.table-wrap { overflow-x: auto; }
+.cell-strong { font-weight: 500; }
+.truncate { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* .icon-btn is display:grid, which is a block box — left alone the seven row
+   actions stack into a column seven tall. Flex lays them out in a line and
+   wraps to a second row only when the column is genuinely too narrow. */
+.actions { white-space: nowrap; }
+.actions-inner {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  justify-content: flex-end; align-items: center;
+  min-width: 150px;
+}
+
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 9px; border-radius: 20px;
+  font-size: 11px; font-weight: 500;
+  background: var(--card-2); color: var(--muted); border: 1px solid var(--border);
+}
+.badge.green  { color: var(--green);  border-color: #22c55e44; }
+.badge.red    { color: var(--red);    border-color: #ef444444; }
+.badge.orange { color: var(--orange); border-color: #f59e0b44; }
+
+.alert {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 11px 13px; border-radius: var(--radius);
+  font-size: 12.5px; line-height: 1.55; margin-bottom: 14px;
+}
+.alert-warn { background: #f59e0b14; border: 1px solid #f59e0b3d; color: #fbbf24; }
+.alert-ok   { background: #22c55e14; border: 1px solid #22c55e3d; color: #4ade80; }
+.alert-err  { background: #ef444414; border: 1px solid #ef44443d; color: #f87171; }
+
+.empty { text-align: center; padding: 44px 20px; color: var(--muted); }
+.empty i { font-size: 26px; color: var(--muted-dim); display: block; margin-bottom: 10px; }
+.loading { text-align: center; padding: 34px; color: var(--muted); }
+.spinner {
+  display: inline-block; width: 18px; height: 18px;
+  border: 2px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin .7s linear infinite;
+}
+
+/* ── Login ──────────────────────────────────────────────────────────────── */
+.login-page { min-height: 100vh; display: grid; place-items: center; padding: 20px; }
+.login-box { width: 100%; max-width: 380px; }
+.login-brand { text-align: center; margin-bottom: 22px; }
+.login-brand .logo {
+  width: 46px; height: 46px; border-radius: 12px; margin: 0 auto 12px;
+  background: var(--purple); color: #fff; display: grid; place-items: center; font-size: 20px;
+}
+
+/* ── Modal ──────────────────────────────────────────────────────────────── */
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(6,8,13,.75);
+  z-index: 200; display: grid; place-items: center; padding: 22px; overflow-y: auto;
+}
+.modal {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); box-shadow: var(--shadow);
+  width: 100%; max-width: 520px; max-height: 90vh;
+  display: flex; flex-direction: column;
+}
+.modal.wide { max-width: 780px; }
+.modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 15px 18px; border-bottom: 1px solid var(--border);
+}
+.modal-body { padding: 18px; overflow-y: auto; }
+.modal-foot {
+  display: flex; justify-content: flex-end; gap: 9px;
+  padding: 13px 18px; border-top: 1px solid var(--border);
+}
+
+/* ── Toast ──────────────────────────────────────────────────────────────── */
+.toast-host {
+  position: fixed; right: 18px; bottom: 18px; z-index: 300;
+  display: flex; flex-direction: column; gap: 8px; max-width: 380px;
+}
+.toast {
+  background: var(--card); border: 1px solid var(--border);
+  border-left: 3px solid var(--accent); border-radius: var(--radius);
+  padding: 11px 13px; box-shadow: var(--shadow);
+  display: flex; gap: 9px; align-items: flex-start; font-size: 12.5px;
+}
+.toast.success { border-left-color: var(--green); }
+.toast.error   { border-left-color: var(--red); }
+.toast.warn    { border-left-color: var(--orange); }
+.toast .close { margin-left: auto; background: none; border: 0; color: var(--muted); cursor: pointer; }
+
+.keybox {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; word-break: break-all;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 11px; margin: 10px 0;
+}
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div id="root"></div>
+<div id="modalHost"></div>
+<div id="toastHost" class="toast-host"></div>
+
+<script>
+/* ==========================================================================
+   Reach X — Admin console
+
+   Talks only to /api/admin/*. Every one of those routes is gated by the admin
+   session in the Worker, so nothing here is a security control — hiding a
+   button stops nobody from POSTing directly. This file is a convenience layer
+   over an API that is already locked down.
+   ========================================================================== */
+
+const $ = (sel, el = document) => el.querySelector(sel);
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+const dateTime = (v) => {
+  if (!v) return '—';
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? String(v)
+    : d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+};
+
+/* ── API ─────────────────────────────────────────────────────────────────── */
+
+const API = (() => {
+  async function req(path, { method = 'GET', body, timeoutMs = 120000 } = {}) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    let res;
+    try {
+      res = await fetch(path, {
+        method,
+        headers: body ? { 'Content-Type': 'application/json' } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: ctrl.signal,
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      throw new Error(err.name === 'AbortError'
+        ? 'The request timed out. Actions that reach a Master Control can take a while.'
+        : 'Network error — could not reach the server.');
+    }
+    clearTimeout(timer);
+
+    // A 401 anywhere means the admin session lapsed. Bounce to the login form
+    // rather than letting every panel render its own "not signed in" error.
+    if (res.status === 401 && !path.endsWith('/login')) {
+      state.admin = null;
+      render();
+      throw new Error('Admin session expired — sign in again.');
+    }
+
+    let data;
+    try { data = await res.json(); }
+    catch { throw new Error('Server returned an unreadable response.'); }
+    if (!data.success) throw new Error(data.error || 'Request failed');
+    return data;
+  }
+
+  return {
+    me:        ()  => req('/api/admin/me'),
+    login:     (p) => req('/api/admin/login',  { method: 'POST', body: p }),
+    logout:    ()  => req('/api/admin/logout', { method: 'POST' }),
+    bootstrap: (p, setupKey) => fetch('/api/admin/bootstrap', {
+                 method: 'POST',
+                 headers: { 'Content-Type': 'application/json', 'X-Setup-Key': setupKey },
+                 body: JSON.stringify(p),
+               }).then(async (r) => {
+                 const d = await r.json();
+                 if (!d.success) throw new Error(d.error || 'Bootstrap failed');
+                 return d;
+               }),
+    changePassword: (p) => req('/api/admin/password', { method: 'POST', body: p }),
+
+    users:      ()  => req('/api/admin/users').then((r) => r.users),
+    saveUser:   (p) => req('/api/admin/users', { method: 'POST', body: p }),
+    deleteUser: (email) => req('/api/admin/users/delete', { method: 'POST', body: { email } }),
+
+    keys:      ()  => req('/api/admin/keys').then((r) => r.keys),
+    createKey: (p) => req('/api/admin/keys', { method: 'POST', body: p }),
+    revokeKey: (key) => req('/api/admin/keys/revoke', { method: 'POST', body: { key } }),
+
+    // Runs any action against one user's Master Control. Not allow-listed —
+    // that is the point of the admin proxy.
+    call: (email, action, params = {}) =>
+      req('/api/admin/call', { method: 'POST', body: { email, action, params }, timeoutMs: 180000 }),
+
+    impersonate: (email) =>
+      req('/api/admin/impersonate', { method: 'POST', body: { email } }).then((r) => r.url),
+  };
+})();
+
+/* ── UI primitives ───────────────────────────────────────────────────────── */
+
+let busyDepth = 0;
+const pushBusy = () => { busyDepth++; document.body.classList.add('is-busy'); };
+const popBusy  = () => { busyDepth = Math.max(0, busyDepth - 1); if (!busyDepth) document.body.classList.remove('is-busy'); };
+const isBusy   = () => busyDepth > 0;
+
+async function withSpinner(btn, fn) {
+  if (!btn) return fn();
+  if (btn.disabled || isBusy()) return;
+  btn.disabled = true;
+  btn.classList.add('is-loading');
+  pushBusy();
+  try { return await fn(); }
+  finally { btn.disabled = false; btn.classList.remove('is-loading'); popBusy(); }
+}
+
+function toast(message, type = 'info', ms = 5000) {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.innerHTML = `<div>${esc(message)}</div>
+                  <button class="close" aria-label="Dismiss"><i class="fa-solid fa-xmark"></i></button>`;
+  el.querySelector('.close').onclick = () => el.remove();
+  $('#toastHost').appendChild(el);
+  if (ms) setTimeout(() => el.remove(), ms);
+}
+const toastErr = (e) => toast(e instanceof Error ? e.message : String(e), 'error', 8000);
+
+function modal({ title, size = '', render, footer, onClose }) {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  backdrop.innerHTML = `
+    <div class="modal ${size}" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <h3>${esc(title)}</h3>
+        <button class="icon-btn plain" data-close aria-label="Close"><i class="fa-solid fa-xmark"></i></button>
+      </div>
+      <div class="modal-body"></div>
+    </div>`;
+
+  const close = () => { backdrop.remove(); document.removeEventListener('keydown', onKey); onClose?.(); };
+  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  backdrop.querySelector('[data-close]').onclick = close;
+  backdrop.addEventListener('mousedown', (e) => { if (e.target === backdrop) close(); });
+  document.addEventListener('keydown', onKey);
+
+  render?.(backdrop.querySelector('.modal-body'), close);
+
+  if (footer) {
+    const foot = document.createElement('div');
+    foot.className = 'modal-foot';
+    footer(foot, close);
+    backdrop.querySelector('.modal').appendChild(foot);
+  }
+  $('#modalHost').appendChild(backdrop);
+  return { close, el: backdrop };
+}
+
+/** Resolves true only on confirm. Lifts the busy lock so it is always answerable. */
+function confirmBox({ title, message, confirmLabel = 'Confirm', danger = true }) {
+  return new Promise((resolve) => {
+    let done = false;
+    const wasBusy = document.body.classList.contains('is-busy');
+    if (wasBusy) document.body.classList.remove('is-busy');
+    const restore = () => { if (wasBusy) document.body.classList.add('is-busy'); };
+
+    modal({
+      title,
+      render: (body) => { body.innerHTML = `<p style="line-height:1.65;color:var(--muted)">${esc(message)}</p>`; },
+      footer: (foot, close) => {
+        const cancel = document.createElement('button');
+        cancel.className = 'btn btn-ghost';
+        cancel.textContent = 'Cancel';
+        cancel.onclick = close;
+        const ok = document.createElement('button');
+        ok.className = `btn ${danger ? 'btn-danger' : 'btn-primary'}`;
+        ok.textContent = confirmLabel;
+        ok.onclick = () => { done = true; close(); resolve(true); };
+        foot.append(cancel, ok);
+      },
+      onClose: () => { restore(); if (!done) resolve(false); },
+    });
+  });
+}
+
+/* ── state ───────────────────────────────────────────────────────────────── */
+
+const state = { admin: null, tab: 'users', users: [], keys: [] };
+
+/* ── login ───────────────────────────────────────────────────────────────── */
+
+function renderLogin(root) {
+  root.innerHTML = `
+    <div class="login-page">
+      <div class="login-box">
+        <div class="login-brand">
+          <div class="logo"><i class="fa-solid fa-shield-halved"></i></div>
+          <h1>Reach X Admin</h1>
+          <div class="muted small" style="margin-top:4px">Operator console</div>
+        </div>
+        <div class="card">
+          <div class="card-body">
+            <div id="loginErr"></div>
+            <div class="field">
+              <label>Admin email</label>
+              <input id="lEmail" type="email" autocomplete="username" autofocus>
+            </div>
+            <div class="field">
+              <label>Password</label>
+              <input id="lPass" type="password" autocomplete="current-password">
+            </div>
+            <button class="btn btn-primary" id="lBtn" style="width:100%">
+              <span>Sign in</span>
+            </button>
+            <div class="field-help" style="text-align:center;margin-top:14px">
+              First time here? <a href="#" id="bootLink" style="color:var(--accent)">Create the first admin</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  const submit = (e) => {
+    const email = $('#lEmail').value.trim();
+    const password = $('#lPass').value;
+    if (!email || !password) return toast('Email and password are required', 'warn');
+    withSpinner(e.currentTarget, async () => {
+      try {
+        const res = await API.login({ email, password });
+        state.admin = res.admin;
+        render();
+      } catch (err) {
+        $('#loginErr').innerHTML = `<div class="alert alert-err">${esc(err.message)}</div>`;
+      }
+    });
+  };
+
+  $('#lBtn').onclick = submit;
+  root.querySelectorAll('input').forEach((i) => {
+    i.onkeydown = (ev) => { if (ev.key === 'Enter') $('#lBtn').click(); };
+  });
+  $('#bootLink').onclick = (ev) => { ev.preventDefault(); bootstrapModal(); };
+}
+
+function bootstrapModal() {
+  modal({
+    title: 'Create the first admin',
+    render: (body) => {
+      body.innerHTML = `
+        <div class="alert alert-warn">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <div>Works only while no admin exists, and only with the
+               <code>ADMIN_SETUP_KEY</code> secret set in Cloudflare. Once an admin
+               exists this route refuses every request.</div>
+        </div>
+        <div class="field">
+          <label>Setup key</label>
+          <input id="bKey" type="password" placeholder="ADMIN_SETUP_KEY value">
+        </div>
+        <div class="field">
+          <label>Admin email</label>
+          <input id="bEmail" type="email">
+        </div>
+        <div class="field">
+          <label>Password — 12 characters or more</label>
+          <input id="bPass" type="password">
+        </div>`;
+    },
+    footer: (foot, close) => {
+      const cancel = document.createElement('button');
+      cancel.className = 'btn btn-ghost';
+      cancel.textContent = 'Cancel';
+      cancel.onclick = close;
+      const go = document.createElement('button');
+      go.className = 'btn btn-primary';
+      go.innerHTML = '<span>Create admin</span>';
+      go.onclick = (e) => withSpinner(e.currentTarget, async () => {
+        try {
+          await API.bootstrap(
+            { email: $('#bEmail').value.trim(), password: $('#bPass').value },
+            $('#bKey').value,
+          );
+          close();
+          toast('Admin created — sign in now', 'success');
+        } catch (err) { toastErr(err); }
+      });
+      foot.append(cancel, go);
+    },
+  });
+}
+
+/* ── shell ───────────────────────────────────────────────────────────────── */
+
+function renderShell(root) {
+  root.innerHTML = `
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo"><i class="fa-solid fa-shield-halved"></i></div>
+        <span>Reach X</span>
+        <span class="tag">Admin</span>
+      </div>
+      <div class="topbar-right">
+        <span class="who">${esc(state.admin.email)}</span>
+        <button class="btn btn-ghost btn-sm" id="pwBtn">
+          <i class="fa-solid fa-key"></i><span>Password</span>
+        </button>
+        <button class="btn btn-ghost btn-sm" id="outBtn">
+          <i class="fa-solid fa-arrow-right-from-bracket"></i><span>Log out</span>
+        </button>
+      </div>
+    </div>
+    <div class="wrap">
+      <div class="tabs">
+        <button data-tab="users" class="${state.tab === 'users' ? 'active' : ''}">
+          <i class="fa-solid fa-users"></i> Users</button>
+        <button data-tab="keys" class="${state.tab === 'keys' ? 'active' : ''}">
+          <i class="fa-solid fa-key"></i> API keys</button>
+      </div>
+      <div id="tabBody"></div>
+    </div>`;
+
+  root.querySelectorAll('[data-tab]').forEach((b) => {
+    b.onclick = () => { if (isBusy()) return; state.tab = b.dataset.tab; render(); };
+  });
+  $('#pwBtn').onclick  = () => passwordModal();
+  $('#outBtn').onclick = (e) => withSpinner(e.currentTarget, async () => {
+    await API.logout().catch(() => {});
+    state.admin = null;
+    render();
+  });
+
+  (state.tab === 'users' ? usersTab : keysTab)($('#tabBody'));
+}
+
+function passwordModal() {
+  modal({
+    title: 'Change admin password',
+    render: (body) => {
+      body.innerHTML = `
+        <div class="field">
+          <label>Current password</label>
+          <input id="pCur" type="password" autocomplete="current-password">
+        </div>
+        <div class="field">
+          <label>New password — 12 characters or more</label>
+          <input id="pNew" type="password" autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label>Repeat new password</label>
+          <input id="pNew2" type="password" autocomplete="new-password">
+        </div>`;
+    },
+    footer: (foot, close) => {
+      const cancel = document.createElement('button');
+      cancel.className = 'btn btn-ghost';
+      cancel.textContent = 'Cancel';
+      cancel.onclick = close;
+      const save = document.createElement('button');
+      save.className = 'btn btn-primary';
+      save.innerHTML = '<span>Change password</span>';
+      save.onclick = (e) => {
+        if ($('#pNew').value !== $('#pNew2').value) return toast('The two new passwords do not match', 'warn');
+        withSpinner(e.currentTarget, async () => {
+          try {
+            await API.changePassword({
+              currentPassword: $('#pCur').value,
+              newPassword: $('#pNew').value,
+            });
+            close();
+            toast('Password changed', 'success');
+          } catch (err) { toastErr(err); }
+        });
+      };
+      foot.append(cancel, save);
+    },
+  });
+}
+
+/* ── users tab ───────────────────────────────────────────────────────────── */
+
+async function usersTab(body) {
+  body.innerHTML = `<div class="loading"><span class="spinner"></span><div style="margin-top:10px">Loading users…</div></div>`;
+  try {
+    state.users = await API.users();
+  } catch (err) {
+    body.innerHTML = `<div class="alert alert-err">${esc(err.message)}</div>`;
+    return;
+  }
+  paintUsers(body);
+}
+
+function paintUsers(body) {
+  const rows = state.users;
+  body.innerHTML = `
+    <div class="card">
+      <div class="card-head">
+        <h3>Users <span class="muted small">(${rows.length})</span></h3>
+        <div class="row row-end">
+          <button class="btn btn-sm" id="bulkSettings"><i class="fa-solid fa-sliders"></i><span>Bulk settings</span></button>
+          <button class="btn btn-sm" id="reloadUsers"><i class="fa-solid fa-rotate"></i><span>Reload</span></button>
+          <button class="btn btn-primary btn-sm" id="addUser"><i class="fa-solid fa-plus"></i><span>Add user</span></button>
+        </div>
+      </div>
+      ${rows.length === 0
+        ? `<div class="empty"><i class="fa-regular fa-user"></i>No users yet. Add the first one.</div>`
+        : `<div class="table-wrap"><table>
+            <thead><tr>
+              <th>Username</th><th>Email</th><th>Master webhook</th>
+              <th>Status</th><th>Last login</th><th></th>
+            </tr></thead>
+            <tbody>
+              ${rows.map((u) => `
+                <tr>
+                  <td class="cell-strong">${esc(u.username || '—')}</td>
+                  <td class="muted">${esc(u.email)}</td>
+                  <td class="muted small truncate" title="${esc(u.masterUrl)}">
+                    ${u.masterUrl ? esc(u.masterUrl) : `<span style="color:var(--orange)">not set</span>`}
+                  </td>
+                  <td>
+                    <span class="badge ${u.disabled ? 'red' : 'green'}">
+                      ${u.disabled ? 'Inactive' : 'Active'}
+                    </span>
+                    ${u.role === 'admin' ? '<span class="badge orange">admin role</span>' : ''}
+                  </td>
+                  <td class="muted small">${esc(dateTime(u.lastLogin))}</td>
+                  <td class="actions"><div class="actions-inner">
+                    <button class="icon-btn plain" data-open="${esc(u.email)}"
+                            title="Open the app as this user — full access to their dashboard, campaigns, leads and settings">
+                      <i class="fa-solid fa-user-secret"></i></button>
+                    <button class="icon-btn plain" data-report="${esc(u.email)}"
+                            title="Client report — a read-only summary to screenshot">
+                      <i class="fa-solid fa-chart-pie"></i></button>
+                    <button class="icon-btn plain" data-ops="${esc(u.email)}"
+                            title="Operations — health, triggers, system boot">
+                      <i class="fa-solid fa-screwdriver-wrench"></i></button>
+                    <button class="icon-btn plain" data-senders="${esc(u.email)}" title="Manage this user's senders">
+                      <i class="fa-solid fa-server"></i></button>
+                    <button class="icon-btn plain" data-toggle="${esc(u.email)}"
+                            title="${u.disabled ? 'Activate' : 'Deactivate'} this account">
+                      <i class="fa-solid fa-${u.disabled ? 'play' : 'pause'}"></i></button>
+                    <button class="icon-btn plain" data-edit="${esc(u.email)}" title="Edit user">
+                      <i class="fa-solid fa-pen"></i></button>
+                    <button class="icon-btn plain danger" data-del="${esc(u.email)}" title="Delete user">
+                      <i class="fa-solid fa-trash"></i></button>
+                  </div></td>
+                </tr>`).join('')}
+            </tbody>
+          </table></div>`}
+    </div>`;
+
+  const find = (email) => state.users.find((u) => u.email === email);
+
+  $('#reloadUsers').onclick   = (e) => withSpinner(e.currentTarget, () => usersTab(body));
+  $('#addUser').onclick       = () => userModal(null, body);
+  $('#bulkSettings').onclick  = () => bulkSettingsModal();
+
+  body.querySelectorAll('[data-ops]').forEach((b) => {
+    b.onclick = () => opsModal(find(b.dataset.ops));
+  });
+  body.querySelectorAll('[data-report]').forEach((b) => {
+    b.onclick = () => clientReportModal(find(b.dataset.report));
+  });
+
+  body.querySelectorAll('[data-edit]').forEach((b) => {
+    b.onclick = () => userModal(find(b.dataset.edit), body);
+  });
+  body.querySelectorAll('[data-senders]').forEach((b) => {
+    b.onclick = () => sendersModal(find(b.dataset.senders));
+  });
+
+  /* Opening the app as a user is the whole answer to "full access to their
+     dashboard, campaigns, leads and settings" — it hands over the real app
+     rather than a second, slowly diverging copy of it inside this console. */
+  body.querySelectorAll('[data-open]').forEach((b) => {
+    b.onclick = async (e) => {
+      const btn = e.currentTarget;
+      const u = find(b.dataset.open);
+      if (!u.masterUrl) return toast(`${u.email} has no Master Control URL set.`, 'warn');
+
+      const ok = await confirmBox({
+        title: `Open the app as ${u.email}`,
+        message: 'You get their account with full access. Anything you do is real: campaigns start, settings change, test emails send. Your admin session stays open in this tab.',
+        confirmLabel: 'Open their account',
+        danger: false,
+      });
+      if (!ok) return;
+
+      withSpinner(btn, async () => {
+        try {
+          const url = await API.impersonate(u.email);
+          // New tab, so the admin console survives — the handoff token is
+          // single-use, and losing this tab would mean minting another.
+          window.open(url, '_blank', 'noopener');
+          toast(`Opened ${u.email} in a new tab`, 'success');
+        } catch (err) { toastErr(err); }
+      });
+    };
+  });
+
+  body.querySelectorAll('[data-toggle]').forEach((b) => {
+    b.onclick = (e) => {
+      const u = find(b.dataset.toggle);
+      withSpinner(e.currentTarget, async () => {
+        try {
+          const res = await API.saveUser({ email: u.email, disabled: !u.disabled });
+          toast(
+            res.user.disabled
+              ? `${u.email} deactivated${res.sessionsRevoked ? ` — ${res.sessionsRevoked} session(s) ended` : ''}`
+              : `${u.email} activated`,
+            'success',
+          );
+          await usersTab(body);
+        } catch (err) { toastErr(err); }
+      });
+    };
+  });
+
+  body.querySelectorAll('[data-del]').forEach((b) => {
+    b.onclick = async (e) => {
+      const btn = e.currentTarget;
+      const email = b.dataset.del;
+      const ok = await confirmBox({
+        title: 'Delete user',
+        message: `Permanently delete ${email}. Their sessions end immediately and every API key issued to them stops working. Their Master Control spreadsheet and its data are untouched. This cannot be undone.`,
+        confirmLabel: 'Delete user',
+      });
+      if (!ok) return;
+      withSpinner(btn, async () => {
+        try {
+          const res = await API.deleteUser(email);
+          toast(`${email} deleted — ${res.sessionsRevoked} session(s) and ${res.keysRevoked} key(s) revoked`, 'success');
+          await usersTab(body);
+        } catch (err) { toastErr(err); }
+      });
+    };
+  });
+}
+
+function userModal(user, body) {
+  const creating = !user;
+  modal({
+    title: creating ? 'Add user' : `Edit ${user.email}`,
+    render: (el) => {
+      el.innerHTML = `
+        <div class="field">
+          <label>Email — the sign-in name</label>
+          <input id="uEmail" type="email" value="${esc(user?.email || '')}" ${creating ? '' : 'disabled'}>
+          ${creating ? '' : '<div class="field-help">The email is the KV key, so it cannot be changed. Delete and recreate to move an account.</div>'}
+        </div>
+        <div class="field">
+          <label>Username — shown in the app</label>
+          <input id="uName" value="${esc(user?.username || '')}" placeholder="e.g. Acme Marketing">
+        </div>
+        <div class="field">
+          <label>Master webhook URL</label>
+          <input id="uMaster" value="${esc(user?.masterUrl || '')}"
+                 placeholder="https://script.google.com/macros/s/…/exec">
+          <div class="field-help">
+            That user's Master Control deployment. Every request they make is proxied here.
+            Changing it ends their current sessions.
+          </div>
+        </div>
+        <div class="field">
+          <label>Password ${creating ? '— 8 characters or more' : '— leave blank to keep the current one'}</label>
+          <input id="uPass" type="password" autocomplete="new-password">
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label>Role</label>
+            <select id="uRole">
+              <option value="user"${user?.role !== 'admin' ? ' selected' : ''}>user</option>
+              <option value="admin"${user?.role === 'admin' ? ' selected' : ''}>admin</option>
+            </select>
+            <div class="field-help">Recorded on the account. It does not grant access to this console — that is a separate credential.</div>
+          </div>
+          <div class="field">
+            <label>Status</label>
+            <select id="uDisabled">
+              <option value="false"${user?.disabled ? '' : ' selected'}>Active</option>
+              <option value="true"${user?.disabled ? ' selected' : ''}>Inactive — cannot sign in</option>
+            </select>
+          </div>
+        </div>`;
+    },
+    footer: (foot, close) => {
+      const cancel = document.createElement('button');
+      cancel.className = 'btn btn-ghost';
+      cancel.textContent = 'Cancel';
+      cancel.onclick = close;
+      const save = document.createElement('button');
+      save.className = 'btn btn-primary';
+      save.innerHTML = `<span>${creating ? 'Create user' : 'Save changes'}</span>`;
+      save.onclick = (e) => {
+        const payload = {
+          email:     creating ? $('#uEmail').value.trim().toLowerCase() : user.email,
+          username:  $('#uName').value.trim(),
+          masterUrl: $('#uMaster').value.trim(),
+          role:      $('#uRole').value,
+          disabled:  $('#uDisabled').value === 'true',
+        };
+        const pass = $('#uPass').value;
+        if (pass) payload.password = pass;
+        if (!payload.email) return toast('Email is required', 'warn');
+        if (creating && !pass) return toast('A password is required for a new user', 'warn');
+
+        withSpinner(e.currentTarget, async () => {
+          try {
+            await API.saveUser(payload);
+            close();
+            toast(creating ? `${payload.email} created` : 'Saved', 'success');
+            await usersTab(body);
+          } catch (err) { toastErr(err); }
+        });
+      };
+      foot.append(cancel, save);
+    },
+  });
+}
+
+/* ── operations ──────────────────────────────────────────────────────────── */
+
+/**
+ * Every action carries its own confirm text or none.
+ *
+ * `confirm` is set on the ones that change the system rather than report on it.
+ * Reads are safe to fire repeatedly; systemBoot and cleanupAllTriggers are not,
+ * and a mis-click on either takes a client's sending down until someone notices.
+ */
+const OPS = [
+  { id: 'ping',           label: 'Check master is reachable', icon: 'fa-plug',           tone: 'primary' },
+  { id: 'healthCheck',    label: 'Health check',              icon: 'fa-heart-pulse' },
+  { id: 'getSystemStatus', label: 'System status',            icon: 'fa-gauge-high' },
+  { id: 'getMasterTriggers', label: 'Master triggers',        icon: 'fa-clock' },
+  { id: 'getFullSystemReport', label: 'Full system report',   icon: 'fa-file-lines' },
+  { id: 'validateSystem', label: 'Validate system',           icon: 'fa-clipboard-check' },
+  { id: 'setupAllTriggers', label: 'Set up all triggers',     icon: 'fa-calendar-plus',
+    confirm: 'Recreates every scheduled trigger on this Master Control and on all its senders. Safe to repeat, but it replaces the current schedule.' },
+  { id: 'cleanupAllTriggers', label: 'Clean up all triggers', icon: 'fa-calendar-xmark', danger: true,
+    confirm: 'Deletes every scheduled trigger on this Master Control and on all its senders. Nothing sends, scans or resets until triggers are set up again. This stops the client\'s campaigns.' },
+  { id: 'systemBoot',     label: 'System boot',               icon: 'fa-power-off', danger: true,
+    confirm: 'Rebuilds every trigger across this whole backend. Run it during setup, or after triggers were wiped — not as a routine fix.' },
+];
+
+function opsModal(user) {
+  if (!user.masterUrl) return toast(`${user.email} has no Master Control URL set.`, 'warn');
+
+  modal({
+    title: `Operations — ${user.username || user.email}`,
+    size: 'wide',
+    render: (el) => {
+      el.innerHTML = `
+        <div class="field-help" style="margin-bottom:12px">
+          Runs against <code class="truncate">${esc(user.masterUrl)}</code>
+        </div>
+        <div class="row" style="gap:8px">
+          ${OPS.map((o) => `
+            <button class="btn ${o.tone === 'primary' ? 'btn-primary' : ''} ${o.danger ? 'btn-danger' : ''} btn-sm"
+                    data-op="${o.id}">
+              <i class="fa-solid ${o.icon}"></i><span>${esc(o.label)}</span>
+            </button>`).join('')}
+        </div>
+        <div id="opOut" class="mt-16"></div>`;
+
+      const out = el.querySelector('#opOut');
+
+      el.querySelectorAll('[data-op]').forEach((b) => {
+        b.onclick = async (e) => {
+          const btn = e.currentTarget;
+          const spec = OPS.find((o) => o.id === b.dataset.op);
+
+          if (spec.confirm) {
+            const ok = await confirmBox({
+              title: spec.label,
+              message: spec.confirm,
+              confirmLabel: spec.label,
+              danger: !!spec.danger,
+            });
+            if (!ok) return;
+          }
+
+          withSpinner(btn, async () => {
+            out.innerHTML = `<div class="loading"><span class="spinner"></span></div>`;
+            const started = Date.now();
+            try {
+              // Reachability has no action of its own — healthCheck is the
+              // cheapest call that proves the deployment answers, so the ping
+              // is that call plus the round-trip time.
+              const action = spec.id === 'ping' ? 'healthCheck' : spec.id;
+              const res = await API.call(user.email, action);
+              const ms = Date.now() - started;
+
+              out.innerHTML = spec.id === 'ping'
+                ? `<div class="alert alert-ok">
+                     <i class="fa-solid fa-circle-check"></i>
+                     <div><strong>Reachable</strong> — answered in ${ms} ms.</div>
+                   </div>${renderResult(res)}`
+                : `<div class="alert alert-ok">
+                     <i class="fa-solid fa-circle-check"></i>
+                     <div><strong>${esc(spec.label)}</strong> — completed in ${ms} ms.</div>
+                   </div>${renderResult(res)}`;
+            } catch (err) {
+              out.innerHTML = `<div class="alert alert-err">
+                  <i class="fa-solid fa-circle-exclamation"></i>
+                  <div><strong>${esc(spec.label)} failed</strong><br>${esc(err.message)}</div>
+                </div>`;
+            }
+          });
+        };
+      });
+    },
+  });
+}
+
+/**
+ * These endpoints have no common envelope — some return a list, some a report
+ * object, some just a message. Pull out what is worth reading at a glance and
+ * keep the raw body one click away rather than guessing at a shape per action.
+ */
+function renderResult(res) {
+  const skip = new Set(['success']);
+  const lines = [];
+
+  Object.entries(res).forEach(([k, v]) => {
+    if (skip.has(k)) return;
+    if (v === null || v === undefined) return;
+    if (Array.isArray(v))        lines.push([k, `${v.length} item(s)`]);
+    else if (typeof v === 'object') lines.push([k, `${Object.keys(v).length} field(s)`]);
+    else                            lines.push([k, String(v)]);
+  });
+
+  return `
+    ${lines.length ? `
+      <div class="card mt-16"><div class="card-body" style="padding:12px">
+        ${lines.map(([k, v]) => `
+          <div class="row" style="justify-content:space-between;padding:4px 0;font-size:12.5px">
+            <span class="muted">${esc(k)}</span><strong>${esc(v)}</strong>
+          </div>`).join('')}
+      </div></div>` : ''}
+    <details class="mt-16">
+      <summary class="muted small" style="cursor:pointer">Raw response</summary>
+      <div class="keybox" style="white-space:pre-wrap;max-height:320px;overflow:auto">${esc(JSON.stringify(res, null, 2))}</div>
+    </details>`;
+}
+
+/* ── bulk settings ───────────────────────────────────────────────────────── */
+
+const BULK_SETTINGS = [
+  { key: 'coldPriorityLimit',     label: 'Cold priority limit',      placeholder: '0.8' },
+  { key: 'followupPriorityLimit', label: 'Follow-up priority limit', placeholder: '0.2' },
+  { key: 'distributionMethod',    label: 'Distribution method',      placeholder: 'roundRobin' },
+  { key: 'alertsEmail',           label: 'Alerts email',             placeholder: 'ops@company.com' },
+  { key: 'flexibleAllocation',    label: 'Flexible allocation',      placeholder: 'TRUE or FALSE' },
+  { key: 'warmupEnabled',         label: 'Warmup enabled',           placeholder: 'TRUE or FALSE' },
+  { key: 'warmupStartLimit',      label: 'Warmup start limit',       placeholder: '5' },
+  { key: 'warmupIncreaseBy',      label: 'Warmup increase by',       placeholder: '5' },
+  { key: 'warmupEveryDays',       label: 'Warmup every N days',      placeholder: '3' },
+  { key: 'warmupMaxLimit',        label: 'Warmup max limit',         placeholder: '25' },
+];
+
+function bulkSettingsModal() {
+  modal({
+    title: 'Bulk settings update',
+    size: 'wide',
+    render: (el) => {
+      el.innerHTML = `
+        <div class="alert alert-warn">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <div>Writes the Settings sheet on every backend you tick. Blank fields are
+               left alone — only what you fill in is changed. The priority limits are
+               fractions of each sender's daily limit, so 0.8 and 0.2, not 80 and 20.</div>
+        </div>
+
+        <div class="field">
+          <label>Apply to</label>
+          <div style="max-height:170px;overflow:auto;border:1px solid var(--border);border-radius:8px;padding:8px">
+            <label class="row" style="padding:4px 2px;border-bottom:1px solid var(--border);margin-bottom:6px">
+              <input type="checkbox" id="bsAll" style="width:auto">
+              <strong style="font-size:12.5px">Select all ${state.users.length}</strong>
+            </label>
+            ${state.users.map((u) => `
+              <label class="row" style="padding:4px 2px">
+                <input type="checkbox" class="bsUser" value="${esc(u.email)}" style="width:auto"
+                       ${u.masterUrl ? '' : 'disabled'}>
+                <span style="flex:1;font-size:12.5px">${esc(u.username || u.email)}</span>
+                <span class="muted small">${u.masterUrl ? esc(u.email) : 'no backend'}</span>
+              </label>`).join('')}
+          </div>
+        </div>
+
+        <div class="grid-2">
+          ${BULK_SETTINGS.map((s) => `
+            <div class="field">
+              <label>${esc(s.label)}</label>
+              <input data-set="${esc(s.key)}" placeholder="${esc(s.placeholder)}">
+            </div>`).join('')}
+        </div>
+
+        <div id="bsOut"></div>`;
+
+      const boxes = [...el.querySelectorAll('.bsUser')].filter((b) => !b.disabled);
+      el.querySelector('#bsAll').onchange = (e) => {
+        boxes.forEach((b) => { b.checked = e.target.checked; });
+      };
+    },
+    footer: (foot, close) => {
+      const cancel = document.createElement('button');
+      cancel.className = 'btn btn-ghost';
+      cancel.textContent = 'Cancel';
+      cancel.onclick = close;
+
+      const apply = document.createElement('button');
+      apply.className = 'btn btn-primary';
+      apply.innerHTML = '<span>Apply</span>';
+      apply.onclick = async (e) => {
+        const btn = e.currentTarget;
+        const emails = [...document.querySelectorAll('.bsUser:checked')].map((b) => b.value);
+        const settings = {};
+        document.querySelectorAll('[data-set]').forEach((i) => {
+          const v = i.value.trim();
+          if (v !== '') settings[i.dataset.set] = v;
+        });
+
+        if (!emails.length) return toast('Tick at least one user', 'warn');
+        if (!Object.keys(settings).length) return toast('Fill in at least one setting', 'warn');
+
+        const ok = await confirmBox({
+          title: 'Apply settings',
+          message: `Write ${Object.keys(settings).length} setting(s) to ${emails.length} backend(s). Existing values for those keys are overwritten.`,
+          confirmLabel: 'Apply',
+          danger: false,
+        });
+        if (!ok) return;
+
+        withSpinner(btn, async () => {
+          const out = document.querySelector('#bsOut');
+          const failed = [];
+          const rejected = [];
+          let done = 0;
+
+          // Sequential: each backend serialises on its own script lock anyway,
+          // and a readable progress line beats a faster unreadable one.
+          for (const email of emails) {
+            out.innerHTML = `<div class="field-help">Updating ${esc(email)} — ${done + 1} of ${emails.length}…</div>`;
+            try {
+              const res = await API.call(email, 'updateSettings', { settings });
+              done++;
+              if (res.rejected?.length) rejected.push(`${email}: ${res.rejected.join(', ')}`);
+            } catch (err) {
+              failed.push(`${email}: ${err.message}`);
+            }
+          }
+
+          out.innerHTML = `
+            <div class="alert ${failed.length ? 'alert-warn' : 'alert-ok'}">
+              <i class="fa-solid fa-${failed.length ? 'triangle-exclamation' : 'circle-check'}"></i>
+              <div><strong>${done} updated, ${failed.length} failed.</strong>
+                ${rejected.length ? `<br>Keys the backend refused: ${esc(rejected.join(' · '))}` : ''}
+                ${failed.length ? `<br>${failed.map(esc).join('<br>')}` : ''}
+              </div>
+            </div>`;
+        });
+      };
+      foot.append(cancel, apply);
+    },
+  });
+}
+
+/* ── client report ───────────────────────────────────────────────────────── */
+
+/**
+ * A read-only summary built for a screenshot.
+ *
+ * The clients on trial want to see results without an account — and an account
+ * is exactly what you do not want to hand out, because a rage-clicked dashboard
+ * spends Apps Script's execution budget and slows sending for everyone on that
+ * backend. This reads the same numbers and renders them as something you can
+ * capture and send.
+ */
+function clientReportModal(user) {
+  if (!user.masterUrl) return toast(`${user.email} has no Master Control URL set.`, 'warn');
+
+  const m = modal({
+    title: `Client report — ${user.username || user.email}`,
+    size: 'wide',
+    render: (el) => { el.innerHTML = `<div class="loading"><span class="spinner"></span></div>`; },
+  });
+  const body = m.el.querySelector('.modal-body');
+  let days = 7;
+
+  const load = async () => {
+    body.innerHTML = `<div class="loading"><span class="spinner"></span><div style="margin-top:10px">Building report…</div></div>`;
+
+    let campaigns = [], summary = [], senders = [];
+    try {
+      // Three reads, in parallel — the client is waiting and these do not
+      // depend on each other.
+      const [c, s, se] = await Promise.all([
+        API.call(user.email, 'getCampaigns'),
+        API.call(user.email, 'getDailySummary', { days }),
+        API.call(user.email, 'getSenders'),
+      ]);
+      campaigns = c.campaigns || [];
+      summary   = s.summary   || [];
+      senders   = se.senders  || [];
+    } catch (err) {
+      body.innerHTML = `<div class="alert alert-err">${esc(err.message)}</div>`;
+      return;
+    }
+
+    const sum = (k) => summary.reduce((a, r) => a + (Number(r[k]) || 0), 0);
+    const sent     = sum('emailsSent');
+    const replies  = sum('repliesReceived');
+    const bounced  = sum('bouncedEmails');
+    const leads    = campaigns.reduce((a, c) => a + (Number(c.totalLeads) || 0), 0);
+    const contacted = campaigns.reduce((a, c) => a + (Number(c.contactedCount ?? c.sentCount) || 0), 0);
+    const activeSenders = senders.filter((s) => s.isActive === 'Active').length;
+    const pct = (n, d) => (d > 0 ? ((n / d) * 100).toFixed(1) + '%' : '—');
+
+    const tile = (label, value, sub) => `
+      <div style="background:var(--card-2);border:1px solid var(--border);border-radius:10px;padding:13px 15px">
+        <div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted-dim)">${esc(label)}</div>
+        <div style="font-size:23px;font-weight:600;margin-top:3px">${esc(value)}</div>
+        ${sub ? `<div style="font-size:11px;color:var(--muted);margin-top:2px">${esc(sub)}</div>` : ''}
+      </div>`;
+
+    body.innerHTML = `
+      <div class="row" style="margin-bottom:14px">
+        <select id="repDays" style="width:auto">
+          <option value="7"${days === 7 ? ' selected' : ''}>Last 7 days</option>
+          <option value="14"${days === 14 ? ' selected' : ''}>Last 14 days</option>
+          <option value="30"${days === 30 ? ' selected' : ''}>Last 30 days</option>
+        </select>
+        <div class="row row-end">
+          <button class="btn btn-sm" id="repDownload">
+            <i class="fa-solid fa-download"></i><span>Download</span></button>
+          <button class="btn btn-sm" id="repPrint">
+            <i class="fa-solid fa-print"></i><span>Print / PDF</span></button>
+        </div>
+      </div>
+      <div class="field-help" style="margin-bottom:10px">
+        Screenshot, download or print the panel below — it holds no URLs, sender
+        addresses or internal IDs, so it can go straight to the client.
+      </div>
+
+      <!-- Everything inside this box is safe to send to the client: no URLs, no
+           sender addresses, no IDs. Just the outcome. -->
+      <div id="reportCard" style="background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px">
+        <div class="row" style="margin-bottom:16px">
+          <div>
+            <div style="font-size:17px;font-weight:600">${esc(user.username || 'Campaign report')}</div>
+            <div class="muted small">Last ${days} days · generated ${esc(new Date().toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' }))}</div>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px">
+          ${tile('Emails sent', sent.toLocaleString(), `over ${days} days`)}
+          ${tile('Replies', replies.toLocaleString(), pct(replies, contacted) + ' of contacted')}
+          ${tile('People contacted', contacted.toLocaleString(), `${leads.toLocaleString()} in the database`)}
+          ${tile('Bounces', bounced.toLocaleString(), pct(bounced, sent) + ' of sent')}
+          ${tile('Sending accounts', String(activeSenders), 'active')}
+        </div>
+
+        ${campaigns.length ? `
+          <div style="margin-top:18px">
+            <div style="font-size:12.5px;font-weight:600;margin-bottom:8px">Campaigns</div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Campaign</th><th>Status</th><th>Leads</th><th>Contacted</th><th>Replies</th><th>Reply rate</th></tr></thead>
+                <tbody>
+                  ${campaigns.map((c) => {
+                    const con = Number(c.contactedCount ?? c.sentCount) || 0;
+                    return `<tr>
+                      <td class="cell-strong">${esc(c.campaignName || c.campaignId)}</td>
+                      <td><span class="badge ${c.campaignStatus === 'Active' ? 'green' : 'orange'}">${esc(c.campaignStatus || '—')}</span></td>
+                      <td class="muted">${Number(c.totalLeads || 0).toLocaleString()}</td>
+                      <td class="muted">${con.toLocaleString()}</td>
+                      <td class="muted">${Number(c.replyCount || 0).toLocaleString()}</td>
+                      <td class="muted">${pct(Number(c.replyCount || 0), con)}</td>
+                    </tr>`;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>
+          </div>` : ''}
+
+        ${summary.length ? `
+          <div style="margin-top:18px">
+            <div style="font-size:12.5px;font-weight:600;margin-bottom:8px">Daily activity</div>
+            <div class="table-wrap" style="max-height:210px;overflow:auto">
+              <table>
+                <thead><tr><th>Date</th><th>Sent</th><th>New contacts</th><th>Follow-ups</th><th>Replies</th></tr></thead>
+                <tbody>
+                  ${summary.slice().reverse().map((r) => `
+                    <tr>
+                      <td class="muted small">${esc(r.date)}</td>
+                      <td>${Number(r.emailsSent || 0).toLocaleString()}</td>
+                      <td class="muted">${Number(r.initialSent || 0).toLocaleString()}</td>
+                      <td class="muted">${Number(r.followupsSent || 0).toLocaleString()}</td>
+                      <td class="muted">${Number(r.repliesReceived || 0).toLocaleString()}</td>
+                    </tr>`).join('')}
+                </tbody>
+              </table>
+            </div>
+          </div>` : ''}
+      </div>`;
+
+    body.querySelector('#repDays').onchange = (e) => {
+      if (isBusy()) return;
+      days = parseInt(e.target.value, 10);
+      load();
+    };
+
+    const title = `${user.username || user.email} — last ${days} days`;
+    const fileStem = `reachx-report-${(user.username || user.email).replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-${new Date().toISOString().slice(0, 10)}`;
+
+    /* The panel is styled with the console's CSS variables, which do not exist
+       outside this page — a copied fragment would render unstyled. Ship the few
+       rules it actually uses along with it, so the file opens correctly anywhere
+       and needs no network of its own. */
+    const standalone = () => `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(title)}</title>
+<style>
+  body { margin:0; padding:24px; background:#0b0d13; color:#e6e9f0;
+         font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-serif;
+         font-size:13.5px; line-height:1.5; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; font-size:10.5px; text-transform:uppercase; letter-spacing:.06em;
+       color:#5b6274; padding:9px 12px; border-bottom:1px solid #232733; }
+  td { padding:11px 12px; border-bottom:1px solid #232733; }
+  tr:last-child td { border-bottom:0; }
+  .muted { color:#8b93a7; } .small { font-size:12px; } .cell-strong { font-weight:500; }
+  .table-wrap { overflow-x:auto; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:20px; font-size:11px;
+           border:1px solid #232733; color:#8b93a7; }
+  .badge.green { color:#22c55e; border-color:#22c55e44; }
+  .badge.orange { color:#f59e0b; border-color:#f59e0b44; }
+  @media print { body { background:#fff; color:#111; } .muted { color:#555; } }
+</style></head><body>
+${body.querySelector('#reportCard').outerHTML}
+</body></html>`;
+
+    body.querySelector('#repDownload').onclick = () => {
+      const blob = new Blob([standalone()], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${fileStem}.html`;
+      a.click();
+      // Revoked on the next tick — releasing it synchronously can cancel the
+      // download before the browser has read the blob.
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      toast('Report downloaded', 'success');
+    };
+
+    /* Printed from a detached window rather than this one: printing the console
+       would carry the modal, the table behind it and every button along with it. */
+    body.querySelector('#repPrint').onclick = () => {
+      const w = window.open('', '_blank');
+      if (!w) return toast('Allow pop-ups for this site to print the report', 'warn');
+      w.document.write(standalone());
+      w.document.close();
+      w.focus();
+      setTimeout(() => w.print(), 250);
+    };
+  };
+
+  load();
+}
+
+/* ── senders of one user ─────────────────────────────────────────────────── */
+
+/** Config keys that live only on the sender, so they can be written but not read back. */
+const SENDER_CONFIG_KEYS = [
+  'masterSpreadsheetId', 'leadsSpreadsheetId', 'senderId', 'senderEmail',
+  'senderFirstName', 'senderLastName', 'dailyLimit', 'sentToday',
+  'totalSentCount', 'repliesReceived', 'bouncedEmails', 'lastRunTime',
+  'masterWebhookUrl', 'lastColdSendTime', 'lastFollowupSendTime', 'isActive',
+];
+
+function sendersModal(user) {
+  if (!user.masterUrl) {
+    return toast(`${user.email} has no Master Control URL set — add one first.`, 'warn');
+  }
+
+  const m = modal({
+    title: `Senders — ${user.username || user.email}`,
+    size: 'wide',
+    render: (el) => { el.innerHTML = `<div class="loading"><span class="spinner"></span></div>`; },
+  });
+
+  const body = m.el.querySelector('.modal-body');
+
+  const load = async () => {
+    body.innerHTML = `<div class="loading"><span class="spinner"></span><div style="margin-top:10px">Reading senderAccounts…</div></div>`;
+    let senders;
+    try {
+      const res = await API.call(user.email, 'getSenders');
+      senders = res.senders || [];
+    } catch (err) {
+      body.innerHTML = `<div class="alert alert-err">${esc(err.message)}</div>`;
+      return;
+    }
+
+    body.innerHTML = `
+      <div class="row" style="margin-bottom:12px">
+        <span class="muted small">${senders.length} sender(s) on this backend</span>
+        <div class="row row-end">
+          <button class="btn btn-sm" id="sReload"><i class="fa-solid fa-rotate"></i><span>Reload</span></button>
+          <button class="btn btn-sm" id="sBulk"><i class="fa-solid fa-file-csv"></i><span>Bulk upload</span></button>
+          <button class="btn btn-primary btn-sm" id="sAdd"><i class="fa-solid fa-plus"></i><span>Add sender</span></button>
+        </div>
+      </div>
+      ${senders.length === 0
+        ? `<div class="empty"><i class="fa-regular fa-envelope"></i>No senders on this Master Control yet.</div>`
+        : `<div class="table-wrap"><table>
+             <thead><tr><th>ID</th><th>Address</th><th>Status</th><th>Today</th><th>Total</th><th></th></tr></thead>
+             <tbody>
+               ${senders.map((s) => `
+                 <tr>
+                   <td class="cell-strong">${esc(s.emailID)}</td>
+                   <td class="muted">${esc(s.emailAddress || '—')}</td>
+                   <td><span class="badge ${s.isActive === 'Active' ? 'green' : 'orange'}">${esc(s.isActive || '—')}</span></td>
+                   <td class="muted small">${esc(s.sentToday)} / ${esc(s.dailyLimit)}</td>
+                   <td class="muted small">${esc(s.totalSentCount)}</td>
+                   <td class="actions">
+                     <button class="icon-btn plain" data-cfg="${esc(s.emailID)}" title="Edit this sender's Config sheet">
+                       <i class="fa-solid fa-sliders"></i></button>
+                   </td>
+                 </tr>`).join('')}
+             </tbody>
+           </table></div>`}`;
+
+    body.querySelector('#sReload').onclick = (e) => withSpinner(e.currentTarget, load);
+    body.querySelector('#sAdd').onclick    = () => addSenderModal(user, load);
+    body.querySelector('#sBulk').onclick   = () => bulkSendersModal(user, load);
+    body.querySelectorAll('[data-cfg]').forEach((b) => {
+      b.onclick = () => senderConfigModal(user, b.dataset.cfg, senders.find((x) => x.emailID === b.dataset.cfg));
+    });
+  };
+
+  load();
+}
+
+function addSenderModal(user, reload) {
+  modal({
+    title: 'Add sender',
+    render: (el) => {
+      el.innerHTML = `
+        <div class="alert alert-warn">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <div>The sender spreadsheet must already have the Reach X scripts deployed,
+               with its web app set to "Anyone" access. This adds the row and seeds
+               its Config sheet; it cannot install the scripts.</div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label>Sender ID</label>
+            <input id="nId" placeholder="S011">
+            <div class="field-help">Must be unique on this backend.</div>
+          </div>
+          <div class="field">
+            <label>Email address</label>
+            <input id="nAddr" type="email" placeholder="name@domain.com">
+          </div>
+        </div>
+        <div class="field">
+          <label>Sender web app URL</label>
+          <input id="nUrl" placeholder="https://script.google.com/macros/s/…/exec">
+        </div>
+        <div class="field">
+          <label>Sender spreadsheet ID</label>
+          <input id="nSheet" placeholder="1AbC…">
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label>First name</label>
+            <input id="nFirst" placeholder="Used for {{senderFirstName}}">
+          </div>
+          <div class="field">
+            <label>Last name</label>
+            <input id="nLast">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label>Daily limit</label>
+            <input id="nLimit" type="number" min="0" max="500" value="25">
+          </div>
+          <div class="field">
+            <label>Status</label>
+            <select id="nActive">
+              <option value="Paused" selected>Paused — verify before it sends</option>
+              <option value="Active">Active</option>
+            </select>
+          </div>
+        </div>`;
+    },
+    footer: (foot, close) => {
+      const cancel = document.createElement('button');
+      cancel.className = 'btn btn-ghost';
+      cancel.textContent = 'Cancel';
+      cancel.onclick = close;
+      const add = document.createElement('button');
+      add.className = 'btn btn-primary';
+      add.innerHTML = '<span>Add sender</span>';
+      add.onclick = (e) => {
+        const payload = {
+          emailID:       $('#nId').value.trim(),
+          emailAddress:  $('#nAddr').value.trim(),
+          webAppUrl:     $('#nUrl').value.trim(),
+          spreadsheetId: $('#nSheet').value.trim(),
+          emailFirstName: $('#nFirst').value.trim(),
+          emailLastName:  $('#nLast').value.trim(),
+          dailyLimit:    parseInt($('#nLimit').value, 10) || 25,
+          isActive:      $('#nActive').value,
+        };
+        for (const [k, label] of [['emailID', 'Sender ID'], ['emailAddress', 'Email address'],
+                                  ['webAppUrl', 'Web app URL'], ['spreadsheetId', 'Spreadsheet ID']]) {
+          if (!payload[k]) return toast(`${label} is required`, 'warn');
+        }
+        withSpinner(e.currentTarget, async () => {
+          try {
+            const res = await API.call(user.email, 'addSender', payload);
+            close();
+            toast(
+              res.configSynced
+                ? `${payload.emailID} added and its Config sheet seeded`
+                : `${payload.emailID} added, but its Config sheet could not be reached — check the web app URL`,
+              res.configSynced ? 'success' : 'warn',
+            );
+            await reload();
+          } catch (err) { toastErr(err); }
+        });
+      };
+      foot.append(cancel, add);
+    },
+  });
+}
+
+/** RFC4180-ish: handles quoted fields, escaped quotes and CRLF. */
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
+      else if (c === '"') inQuotes = false;
+      else field += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      if (row.some((x) => x.trim() !== '')) rows.push(row);
+      row = [];
+    } else field += c;
+  }
+  row.push(field);
+  if (row.some((x) => x.trim() !== '')) rows.push(row);
+  return rows;
+}
+
+const BULK_COLUMNS = ['emailID', 'emailAddress', 'webAppUrl', 'spreadsheetId',
+                      'emailFirstName', 'emailLastName', 'dailyLimit', 'isActive'];
+
+function bulkSendersModal(user, reload) {
+  modal({
+    title: 'Bulk sender upload',
+    size: 'wide',
+    render: (el) => {
+      el.innerHTML = `
+        <div class="alert alert-warn">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <div>Each sender spreadsheet must already have the Reach X scripts deployed
+               with its web app set to "Anyone" access. This creates the rows and seeds
+               each Config sheet — it cannot install the scripts.</div>
+        </div>
+
+        <div class="field">
+          <label>Paste CSV — first row must be the header</label>
+          <textarea id="bCsv" rows="9" spellcheck="false"
+            placeholder="emailID,emailAddress,webAppUrl,spreadsheetId,emailFirstName,emailLastName,dailyLimit,isActive
+S011,a@x.com,https://script.google.com/macros/s/AAA/exec,1AbC…,Alex,Morgan,25,Paused"></textarea>
+          <div class="field-help">
+            Required: <code>emailID</code>, <code>emailAddress</code>,
+            <code>webAppUrl</code>, <code>spreadsheetId</code>. The rest are optional —
+            <code>dailyLimit</code> defaults to 25 and <code>isActive</code> to Paused.
+            Column order does not matter; names must match exactly.
+          </div>
+        </div>
+
+        <button class="btn" id="bCheck"><span>Check the CSV</span></button>
+        <div id="bOut" class="mt-16"></div>`;
+
+      let parsed = [];
+
+      el.querySelector('#bCheck').onclick = () => {
+        const out = el.querySelector('#bOut');
+        const rows = parseCSV(el.querySelector('#bCsv').value.trim());
+        parsed = [];
+
+        if (rows.length < 2) {
+          out.innerHTML = `<div class="alert alert-err">Need a header row and at least one sender.</div>`;
+          return;
+        }
+
+        const headers = rows[0].map((h) => h.trim());
+        const missing = ['emailID', 'emailAddress', 'webAppUrl', 'spreadsheetId']
+          .filter((c) => !headers.includes(c));
+        if (missing.length) {
+          out.innerHTML = `<div class="alert alert-err">Header is missing: ${esc(missing.join(', '))}</div>`;
+          return;
+        }
+
+        const problems = [];
+        const seen = new Set();
+        rows.slice(1).forEach((r, i) => {
+          const rec = {};
+          headers.forEach((h, c) => { if (BULK_COLUMNS.includes(h)) rec[h] = (r[c] || '').trim(); });
+          const line = i + 2;
+
+          for (const c of ['emailID', 'emailAddress', 'webAppUrl', 'spreadsheetId']) {
+            if (!rec[c]) problems.push(`Line ${line}: ${c} is empty`);
+          }
+          // Caught here rather than by the backend, which would create the first
+          // and reject the second, leaving the upload half applied.
+          if (rec.emailID && seen.has(rec.emailID)) problems.push(`Line ${line}: duplicate emailID ${rec.emailID}`);
+          if (rec.emailID) seen.add(rec.emailID);
+          if (rec.webAppUrl && !/^https:\/\/script\.google\.com\//.test(rec.webAppUrl)) {
+            problems.push(`Line ${line}: webAppUrl does not look like an Apps Script /exec URL`);
+          }
+          rec.dailyLimit = parseInt(rec.dailyLimit, 10) || 25;
+          rec.isActive   = rec.isActive === 'Active' ? 'Active' : 'Paused';
+          parsed.push(rec);
+        });
+
+        out.innerHTML = `
+          ${problems.length
+            ? `<div class="alert alert-err">
+                 <i class="fa-solid fa-circle-exclamation"></i>
+                 <div><strong>${problems.length} problem(s) — nothing will be uploaded:</strong><br>
+                      ${problems.slice(0, 12).map(esc).join('<br>')}
+                      ${problems.length > 12 ? `<br>…and ${problems.length - 12} more` : ''}</div>
+               </div>`
+            : `<div class="alert alert-ok">
+                 <i class="fa-solid fa-circle-check"></i>
+                 <div>${parsed.length} sender(s) ready. ${parsed.filter((p) => p.isActive === 'Active').length} will be Active immediately.</div>
+               </div>`}
+          <div class="table-wrap" style="border:1px solid var(--border);border-radius:8px;max-height:240px;overflow:auto">
+            <table>
+              <thead><tr><th>ID</th><th>Address</th><th>Limit</th><th>Status</th></tr></thead>
+              <tbody>${parsed.map((p) => `
+                <tr><td class="cell-strong">${esc(p.emailID)}</td>
+                    <td class="muted">${esc(p.emailAddress)}</td>
+                    <td class="muted small">${esc(p.dailyLimit)}</td>
+                    <td><span class="badge ${p.isActive === 'Active' ? 'green' : 'orange'}">${esc(p.isActive)}</span></td></tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+          ${problems.length ? '' : `
+            <button class="btn btn-primary mt-16" id="bGo">
+              <span>Upload ${parsed.length} sender(s)</span></button>
+            <div id="bProgress" class="field-help" style="margin-top:8px"></div>`}`;
+
+        const go = out.querySelector('#bGo');
+        if (!go) return;
+
+        go.onclick = (e) => withSpinner(e.currentTarget, async () => {
+          const prog = out.querySelector('#bProgress');
+          const failed = [];
+          let added = 0, noConfig = 0;
+
+          // One at a time on purpose: Master Control serialises on a script lock,
+          // so parallel calls only queue up and burn the execution budget.
+          for (let i = 0; i < parsed.length; i++) {
+            prog.textContent = `Adding ${i + 1} of ${parsed.length} — ${parsed[i].emailID}…`;
+            try {
+              const res = await API.call(user.email, 'addSender', parsed[i]);
+              added++;
+              if (!res.configSynced) noConfig++;
+            } catch (err) {
+              failed.push(`${parsed[i].emailID}: ${err.message}`);
+            }
+          }
+
+          prog.textContent = '';
+          out.innerHTML = `
+            <div class="alert ${failed.length ? 'alert-warn' : 'alert-ok'}">
+              <i class="fa-solid fa-${failed.length ? 'triangle-exclamation' : 'circle-check'}"></i>
+              <div><strong>${added} added, ${failed.length} failed.</strong>
+                ${noConfig ? `<br>${noConfig} could not be reached to seed the Config sheet — check those web app URLs.` : ''}
+                ${failed.length ? `<br>${failed.slice(0, 10).map(esc).join('<br>')}` : ''}
+              </div>
+            </div>`;
+          await reload();
+        });
+      };
+    },
+  });
+}
+
+function senderConfigModal(user, emailID, known) {
+  modal({
+    title: `Config — ${emailID}`,
+    size: 'wide',
+    render: (el) => {
+      el.innerHTML = `
+        <div class="alert alert-warn">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <div>These write straight into the sender's own Config sheet. Blank fields are
+               left alone; anything you fill in is overwritten. Counters like
+               <code>sentToday</code> feed the daily limit — setting one wrong lets the
+               account send past its cap.</div>
+        </div>
+        <div class="grid-2">
+          ${SENDER_CONFIG_KEYS.map((k) => `
+            <div class="field">
+              <label>${esc(k)}</label>
+              <input data-key="${esc(k)}" placeholder="${esc(String(known?.[hintFor(k)] ?? ''))}">
+            </div>`).join('')}
+        </div>
+        <div class="field-help">
+          Placeholders show what Master Control has on record where it holds the same value.
+          The sender's own copy is write-only from here — there is no read-back action that
+          would not need every sender redeployed.
+        </div>`;
+    },
+    footer: (foot, close) => {
+      const cancel = document.createElement('button');
+      cancel.className = 'btn btn-ghost';
+      cancel.textContent = 'Cancel';
+      cancel.onclick = close;
+      const save = document.createElement('button');
+      save.className = 'btn btn-primary';
+      save.innerHTML = '<span>Write config</span>';
+      save.onclick = (e) => {
+        const config = {};
+        document.querySelectorAll('[data-key]').forEach((i) => {
+          const v = i.value.trim();
+          if (v !== '') config[i.dataset.key] = v;
+        });
+        if (Object.keys(config).length === 0) return toast('Nothing filled in', 'warn');
+        withSpinner(e.currentTarget, async () => {
+          try {
+            const res = await API.call(user.email, 'setSenderConfig', { emailID, config });
+            close();
+            toast(`Wrote ${res.written} key(s) to ${emailID}`, 'success');
+          } catch (err) { toastErr(err); }
+        });
+      };
+      foot.append(cancel, save);
+    },
+  });
+}
+
+/** Maps a sender Config key to the senderAccounts field holding the same value. */
+function hintFor(key) {
+  return ({
+    senderId: 'emailID', senderEmail: 'emailAddress',
+    senderFirstName: 'emailFirstName', senderLastName: 'emailLastName',
+    dailyLimit: 'dailyLimit', sentToday: 'sentToday',
+    totalSentCount: 'totalSentCount', repliesReceived: 'repliesReceived',
+    bouncedEmails: 'bouncedEmails', lastRunTime: 'lastRunTime', isActive: 'isActive',
+  })[key] || '__none__';
+}
+
+/* ── API keys tab ────────────────────────────────────────────────────────── */
+
+async function keysTab(body) {
+  body.innerHTML = `<div class="loading"><span class="spinner"></span><div style="margin-top:10px">Loading keys…</div></div>`;
+  try {
+    [state.keys, state.users] = await Promise.all([API.keys(), API.users()]);
+  } catch (err) {
+    body.innerHTML = `<div class="alert alert-err">${esc(err.message)}</div>`;
+    return;
+  }
+
+  body.innerHTML = `
+    <div class="card">
+      <div class="card-head">
+        <h3>API keys <span class="muted small">(${state.keys.length})</span></h3>
+        <button class="btn btn-primary btn-sm" id="newKey"><i class="fa-solid fa-plus"></i><span>Create key</span></button>
+      </div>
+      <div class="card-body" style="padding-bottom:0">
+        <div class="alert alert-warn">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <div>A key never expires and carries that user's full access — including
+               Emergency Stop and Purge All Inboxes. Keys are shown in full here, so
+               treat this screen the way you would a password manager. Revoking is
+               instant. Issue one key per automation so you can kill one without
+               breaking the rest.</div>
+        </div>
+      </div>
+      ${state.keys.length === 0
+        ? `<div class="empty"><i class="fa-solid fa-key"></i>No API keys issued.</div>`
+        : `<div class="table-wrap"><table>
+             <thead><tr><th>Key</th><th>User</th><th>Label</th><th>Created</th><th></th></tr></thead>
+             <tbody>
+               ${state.keys.map((k) => `
+                 <tr>
+                   <td><code style="font-size:11px;word-break:break-all">${esc(k.key)}</code></td>
+                   <td class="muted">${esc(k.email)}</td>
+                   <td class="muted small">${esc(k.label) || '—'}</td>
+                   <td class="muted small">${esc(dateTime(k.createdAt))}</td>
+                   <td class="actions"><div class="actions-inner" style="min-width:70px">
+                     <button class="icon-btn plain" data-copy="${esc(k.key)}" title="Copy key">
+                       <i class="fa-regular fa-copy"></i></button>
+                     <button class="icon-btn plain danger" data-revoke="${esc(k.key)}" title="Revoke this key">
+                       <i class="fa-solid fa-trash"></i></button>
+                   </div></td>
+                 </tr>`).join('')}
+             </tbody>
+           </table></div>`}
+    </div>`;
+
+  $('#newKey').onclick = () => newKeyModal(body);
+
+  body.querySelectorAll('[data-copy]').forEach((b) => {
+    b.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(b.dataset.copy);
+        toast('Key copied', 'success');
+      } catch {
+        toast('Could not copy — select the key in the table and copy it manually', 'warn');
+      }
+    };
+  });
+
+  body.querySelectorAll('[data-revoke]').forEach((b) => {
+    b.onclick = async (e) => {
+      const btn = e.currentTarget;
+      const key = b.dataset.revoke;
+      const rec = state.keys.find((k) => k.key === key);
+      const ok = await confirmBox({
+        title: 'Revoke API key',
+        message: `Any automation using this key stops working immediately${rec?.label ? ` — labelled "${rec.label}"` : ''}. This cannot be undone; issue a new key instead.`,
+        confirmLabel: 'Revoke key',
+      });
+      if (!ok) return;
+      withSpinner(btn, async () => {
+        try {
+          await API.revokeKey(key);
+          toast('Key revoked', 'success');
+          await keysTab(body);
+        } catch (err) { toastErr(err); }
+      });
+    };
+  });
+}
+
+function newKeyModal(body) {
+  modal({
+    title: 'Create API key',
+    render: (el) => {
+      el.innerHTML = `
+        <div class="field">
+          <label>User this key acts as</label>
+          <select id="kUser">
+            ${state.users.map((u) => `<option value="${esc(u.email)}">${esc(u.username || u.email)} — ${esc(u.email)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field">
+          <label>Label</label>
+          <input id="kLabel" placeholder="e.g. n8n lead sync">
+          <div class="field-help">Only for your own reference — one key per automation.</div>
+        </div>`;
+    },
+    footer: (foot, close) => {
+      const cancel = document.createElement('button');
+      cancel.className = 'btn btn-ghost';
+      cancel.textContent = 'Cancel';
+      cancel.onclick = close;
+      const go = document.createElement('button');
+      go.className = 'btn btn-primary';
+      go.innerHTML = '<span>Create key</span>';
+      go.onclick = (e) => withSpinner(e.currentTarget, async () => {
+        try {
+          const res = await API.createKey({ email: $('#kUser').value, label: $('#kLabel').value.trim() });
+          close();
+          showKeyOnce(res.key, body);
+        } catch (err) { toastErr(err); }
+      });
+      foot.append(cancel, go);
+    },
+  });
+}
+
+function showKeyOnce(key, body) {
+  modal({
+    title: 'Copy this key now',
+    render: (el) => {
+      el.innerHTML = `
+        <div class="alert alert-warn">
+          <i class="fa-solid fa-triangle-exclamation"></i>
+          <div>This is the only time the full key is shown. It is not recoverable —
+               if it is lost, revoke it and issue another.</div>
+        </div>
+        <div class="keybox" id="keyOut">${esc(key)}</div>
+        <button class="btn" id="copyKey"><i class="fa-regular fa-copy"></i><span>Copy to clipboard</span></button>
+        <div class="field-help" style="margin-top:14px">
+          In n8n: Header Auth credential, name <code>X-API-Key</code>, value this key.
+          Point it at <code>/api/call</code>.
+        </div>`;
+      el.querySelector('#copyKey').onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(key);
+          toast('Key copied', 'success');
+        } catch {
+          toast('Could not copy — select the key and copy it manually', 'warn');
+        }
+      };
+    },
+    footer: (foot, close) => {
+      const done = document.createElement('button');
+      done.className = 'btn btn-primary';
+      done.textContent = 'Done';
+      done.onclick = () => { close(); keysTab(body); };
+      foot.append(done);
+    },
+  });
+}
+
+/* ── boot ────────────────────────────────────────────────────────────────── */
+
+function render() {
+  const root = $('#root');
+  $('#modalHost').innerHTML = '';
+  if (state.admin) renderShell(root);
+  else renderLogin(root);
+}
+
+(async function boot() {
+  try {
+    const res = await API.me();
+    state.admin = res.admin;
+  } catch {
+    state.admin = null;                 // not signed in is the normal first visit
+  }
+  render();
+})();
+</script>
+</body>
+</html>
