@@ -904,8 +904,24 @@ function sendColdEmail(toEmail, template, leadObj, senderObj, config) {
     replyTo: config.replyToEmail || config.senderEmail || ''
   });
 
-  const sent     = GmailApp.search('to:' + toEmail + ' subject:"' + subject + '" in:sent', 0, 1);
-  const threadId = sent.length > 0 ? sent[0].getId() : '';
+  // Gmail's index is eventually consistent — searching immediately after send
+  // often returns nothing. An empty threadId means the reply scanner can never
+  // match this lead, so we keep emailing someone who answered. Dropping the
+  // subject: clause also removes spintax/quoting fragility.
+  let threadId = '';
+  for (let attempt = 0; attempt < 3 && !threadId; attempt++) {
+    if (attempt > 0) { Utilities.sleep(1500); }
+    try {
+      const sent = GmailApp.search('to:' + toEmail + ' in:sent newer_than:1d', 0, 1);
+      if (sent.length > 0) { threadId = sent[0].getId(); }
+    } catch (e) {
+      log('sendColdEmail: threadId lookup failed — ' + e.message, 'WARN');
+    }
+  }
+  if (!threadId) {
+    log('sendColdEmail: NO threadId for ' + toEmail + ' — replies from this lead ' +
+        'will not be detected.', 'ERROR');
+  }
   return { threadId: threadId };
 }
 
@@ -1113,13 +1129,22 @@ function savePendingUpdates_(masterWebhookUrl, updates, action, senderId) {
     cache.put(indexKey, JSON.stringify(keyList), 7200);
     log('savePendingUpdates_: saved ' + updates.length + ' updates to cache key ' + key, 'INFO');
 
-    // Schedule a retry trigger in 5-8 minutes
-    const delayMs = (5 * 60 * 1000) + Math.floor(Math.random() * 3 * 60 * 1000);
-    ScriptApp.newTrigger('retryPendingUpdates')
-      .timeBased()
-      .after(delayMs)
-      .create();
-    log('savePendingUpdates_: retry trigger scheduled in ' + Math.round(delayMs / 60000) + ' min', 'INFO');
+    // ONE retry trigger drains the entire pending index. Creating one per failed
+    // batch burns the 20-trigger-per-script cap exactly when batches are failing,
+    // and once create() throws, the cached batch has nothing to retry it.
+    const pendingTriggers = ScriptApp.getProjectTriggers().filter(function (t) {
+      return t.getHandlerFunction() === 'retryPendingUpdates';
+    });
+    if (pendingTriggers.length === 0) {
+      const delayMs = (5 * 60 * 1000) + Math.floor(Math.random() * 3 * 60 * 1000);
+      ScriptApp.newTrigger('retryPendingUpdates')
+        .timeBased()
+        .after(delayMs)
+        .create();
+      log('savePendingUpdates_: retry trigger scheduled in ' + Math.round(delayMs / 60000) + ' min', 'INFO');
+    } else {
+      log('savePendingUpdates_: retry trigger already pending — not creating another', 'INFO');
+    }
   } catch (e) {
     log('savePendingUpdates_: error saving to cache — ' + e.message, 'ERROR');
   }
@@ -1131,7 +1156,6 @@ function retryPendingUpdates() {
   for (let i = 0; i < triggers.length; i++) {
     if (triggers[i].getHandlerFunction() === 'retryPendingUpdates') {
       ScriptApp.deleteTrigger(triggers[i]);
-      break;
     }
   }
 
