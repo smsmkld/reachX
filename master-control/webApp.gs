@@ -445,9 +445,11 @@ function handleUpdateColdSent(params) {
     stagingSheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
     SpreadsheetApp.flush();
 
-    // Still increment sender counters — this is fast, no masterLeads touch
-    if (batchKey) { CacheService.getScriptCache().put(batchKey, '1', 7200); }
+    // Counters first, THEN the dedup marker. incrementSenderCounters swallows
+    // its own errors, so marking first can strand a batch: flagged as applied,
+    // counters never moved, retry skipped as a duplicate.
     incrementSenderCounters(updates.length, 0, params.senderId || '');
+    if (batchKey) { CacheService.getScriptCache().put(batchKey, '1', 7200); }
 
     log('handleUpdateColdSent: staged ' + rows.length + ' updates', 'INFO');
     return { success: true, staged: rows.length };
@@ -520,8 +522,8 @@ function handleUpdateFollowupSent(params) {
     SpreadsheetApp.flush();
 
     // Increment sender counters — fast, no masterLeads touch
-    if (batchKey) { CacheService.getScriptCache().put(batchKey, '1', 7200); }
     incrementSenderCounters(0, updates.length, params.senderId || '');
+    if (batchKey) { CacheService.getScriptCache().put(batchKey, '1', 7200); }
 
     log('handleUpdateFollowupSent: staged ' + rows.length + ' updates', 'INFO');
     return { success: true, staged: rows.length };
@@ -1059,38 +1061,53 @@ function incrementSenderCounters(coldCount, followupCount, senderId) {
     const lastRow = sheet.getLastRow();
     if (lastRow < 2) { return; }
 
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const data    = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
-
+        const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     const col = {};
     headers.forEach(function(h, i) { col[String(h).trim()] = i; });
 
-    let matchedIndex = -1;
+    // Remember where this sender lives so the hot path reads ONE row, not all
+    // of them. This runs once per email sent — ~5000x/day at 200 senders — and
+    // it runs inside a script-wide lock every other sender is queued behind.
+    const cache  = CacheService.getScriptCache();
+    const rowKey = 'senderRow_' + senderId;
+    let   rowNum = parseInt(cache.get(rowKey) || 0, 10);
+    let   row    = null;
 
-    for (let i = 0; i < data.length; i++) {
-      const rowSenderId = String(data[i][col['emailID']] || '').trim();
-      if (rowSenderId !== senderId) { continue; }
-
-      if ('sentToday'          in col) { data[i][col['sentToday']]          = (parseInt(data[i][col['sentToday']]          || 0, 10)) + coldCount + followupCount; }
-      if ('totalSentCount'     in col) { data[i][col['totalSentCount']]     = (parseInt(data[i][col['totalSentCount']]     || 0, 10)) + coldCount + followupCount; }
-      if ('totalLeadsContacted' in col && coldCount > 0) { data[i][col['totalLeadsContacted']] = (parseInt(data[i][col['totalLeadsContacted']] || 0, 10)) + coldCount; }
-      if ('initialSentToday'   in col && coldCount     > 0) { data[i][col['initialSentToday']]   = (parseInt(data[i][col['initialSentToday']]   || 0, 10)) + coldCount; }
-      if ('followupSentToday'  in col && followupCount > 0) { data[i][col['followupSentToday']]  = (parseInt(data[i][col['followupSentToday']]  || 0, 10)) + followupCount; }
-      if ('lastRunTime'        in col) { data[i][col['lastRunTime']]        = new Date().toISOString(); }
-      matchedIndex = i;
-      break;
+    if (rowNum >= 2 && rowNum <= lastRow) {
+      const candidate = sheet.getRange(rowNum, 1, 1, headers.length).getValues()[0];
+      if (String(candidate[col['emailID']] || '').trim() === senderId) { row = candidate; }
     }
 
-    if (matchedIndex === -1) {
+    if (!row) {                       // cache miss, or rows were inserted/removed
+      const all = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+      for (let i = 0; i < all.length; i++) {
+        if (String(all[i][col['emailID']] || '').trim() === senderId) {
+          row    = all[i];
+          rowNum = i + 2;
+          cache.put(rowKey, String(rowNum), 21600);   // 6 hours
+          break;
+        }
+      }
+    }
+
+    if (!row) {
       log('incrementSenderCounters: sender ' + senderId + ' not found in senderAccounts', 'WARN');
       return;
     }
 
+    if ('sentToday'           in col) { row[col['sentToday']]           = (parseInt(row[col['sentToday']]           || 0, 10)) + coldCount + followupCount; }
+    if ('totalSentCount'      in col) { row[col['totalSentCount']]      = (parseInt(row[col['totalSentCount']]      || 0, 10)) + coldCount + followupCount; }
+    if ('totalLeadsContacted' in col && coldCount     > 0) { row[col['totalLeadsContacted']] = (parseInt(row[col['totalLeadsContacted']] || 0, 10)) + coldCount; }
+    if ('initialSentToday'    in col && coldCount     > 0) { row[col['initialSentToday']]    = (parseInt(row[col['initialSentToday']]    || 0, 10)) + coldCount; }
+    if ('followupSentToday'   in col && followupCount > 0) { row[col['followupSentToday']]   = (parseInt(row[col['followupSentToday']]   || 0, 10)) + followupCount; }
+    if ('lastRunTime'         in col) { row[col['lastRunTime']]         = new Date().toISOString(); }
+
     // Write ONLY this sender's row. Writing back the whole array would push a
-    // snapshot taken at read time over the top of every other sender's row —
-    // at 200-300 senders that reverts other senders' counters and any UI edit
-    // (dailyLimit, isActive, tags) made while this request was in flight.
-    sheet.getRange(matchedIndex + 2, 1, 1, headers.length).setValues([data[matchedIndex]]);
+    // read-time snapshot over every other sender's row.
+    sheet.getRange(rowNum, 1, 1, headers.length).setValues([row]);
+    // Flush BEFORE the caller releases the lock. An unflushed write can still be
+    // pending when the lock opens, letting the next callback read a stale
+    // sentToday — the exact race the lock exists to prevent.
     SpreadsheetApp.flush();
 
   } catch (e) {
@@ -2886,58 +2903,6 @@ function syncLeadTotalSteps_(campaignId, totalSteps) {
   }
 }
 
-/**
- * Rewrites totalSequenceSteps on every lead in a campaign after its step
- * count changes. Also releases leads that were marked Completed only because
- * they had reached the old final step.
- *
- * @param {string} campaignId
- * @param {number} totalSteps
- * @returns {number} rows updated
- */
-function syncLeadTotalSteps_(campaignId, totalSteps) {
-  try {
-    const settings = getSettings(MASTER_SHEET_ID);
-    const ss       = SpreadsheetApp.openById(settings.leadsSpreadsheetId);
-    const sheet    = ss.getSheetByName(LEADS_SHEET_NAME);
-    if (!sheet || sheet.getLastRow() < 2) { return 0; }
-
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const data    = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-    const col     = {};
-    headers.forEach(function(h, i) { col[String(h).trim()] = i; });
-
-    if (!('totalSequenceSteps' in col)) { return 0; }
-
-    let changed = 0;
-    for (let i = 0; i < data.length; i++) {
-      if (String(data[i][col['campaignId']] || '').trim() !== campaignId) { continue; }
-
-      data[i][col['totalSequenceSteps']] = totalSteps;
-      changed++;
-
-      // A lead parked at the old last step should resume when steps are added.
-      if ('sequenceStatus' in col) {
-        const step = parseInt(data[i][col['sequenceStep']] || 0, 10);
-        const done = String(data[i][col['sequenceStatus']] || '').trim();
-        if (done === 'Completed' && step < totalSteps) {
-          data[i][col['sequenceStatus']] = '';
-        }
-      }
-    }
-
-    if (changed > 0) {
-      sheet.getRange(2, 1, data.length, headers.length).setValues(data);
-      SpreadsheetApp.flush();
-    }
-    return changed;
-
-  } catch (e) {
-    log('syncLeadTotalSteps_: error — ' + e.message, 'ERROR');
-    return 0;
-  }
-}
-
 function handleGetDailySummary(params) {
   const days = parseInt(params.days || 14, 10); // default last 14 days
 
@@ -3235,6 +3200,15 @@ function handleArchiveCampaignLeads(params) {
   const campaignId = String(params.campaignId || '').trim();
   if (!campaignId) { return { success: false, error: 'Missing campaignId' }; }
 
+  // This function does read-all -> clearContent -> write-back-subset on
+  // masterLeads. distributeCold and processStagingUpdates write to the same
+  // sheet under this lock. Without it, their writes land inside our window and
+  // get erased by our stale snapshot.
+  if (!acquireLock(60)) {
+    log('handleArchiveCampaignLeads: could not acquire lock — try again shortly', 'WARN');
+    return { success: false, error: 'Busy — another job is writing to masterLeads. Try again in a minute.' };
+  }
+
   try {
     const settings     = getSettings(MASTER_SHEET_ID);
     const leadsSheetId = settings.leadsSpreadsheetId;
@@ -3306,9 +3280,20 @@ function handleArchiveCampaignLeads(params) {
     }
 
     // ── Rewrite masterLeads without archived leads ───────────────────────
-    sheet.getRange(2, 1, lastRow - 1, headers.length).clearContent();
-    if (toKeep.length > 0) {
-      sheet.getRange(2, 1, toKeep.length, headers.length).setValues(toKeep);
+    // Re-read RIGHT BEFORE the write. The snapshot above is 10-30s old by now
+    // (spreadsheet creation, Drive sharing, email), and anything written to
+    // masterLeads in that window would be erased by the clearContent below.
+    const freshLast = sheet.getLastRow();
+    const freshData = freshLast > 1
+      ? sheet.getRange(2, 1, freshLast - 1, headers.length).getValues()
+      : [];
+    const freshKeep = freshData.filter(function (r) {
+      return String(r[col['campaignId']] || '').trim() !== campaignId;
+    });
+
+    sheet.getRange(2, 1, freshLast - 1, headers.length).clearContent();
+    if (freshKeep.length > 0) {
+      sheet.getRange(2, 1, freshKeep.length, headers.length).setValues(freshKeep);
     }
     SpreadsheetApp.flush();
 
@@ -3336,6 +3321,8 @@ function handleArchiveCampaignLeads(params) {
   } catch(e) {
     log('handleArchiveCampaignLeads: error — ' + e.message, 'ERROR');
     return { success: false, error: e.message };
+  } finally {
+    releaseLock();
   }
 }
 
